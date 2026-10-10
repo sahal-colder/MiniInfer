@@ -2,5 +2,6 @@
 /build-*/
 /install/
 /docs/presentation/
+/.workbuddy/
 __pycache__/
 *.pyc
