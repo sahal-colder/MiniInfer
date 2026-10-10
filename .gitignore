@@ -1,0 +1,6 @@
+/build/
+/build-*/
+/install/
+/docs/presentation/
+__pycache__/
+*.pyc

@@ -1,0 +1,15 @@
+@PACKAGE_INIT@
+include(CMakeFindDependencyMacro)
+find_dependency(CUDAToolkit)
+find_dependency(Threads)
+if(@MINI_INFER_WITH_ARMADILLO@)
+    find_dependency(Armadillo)
+    if(NOT TARGET Armadillo::Armadillo)
+        add_library(Armadillo::Armadillo INTERFACE IMPORTED)
+        set_target_properties(Armadillo::Armadillo PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${ARMADILLO_INCLUDE_DIRS}"
+            INTERFACE_LINK_LIBRARIES "${ARMADILLO_LIBRARIES}")
+    endif()
+endif()
+include("${CMAKE_CURRENT_LIST_DIR}/MiniInferTargets.cmake")
+check_required_components(MiniInfer)

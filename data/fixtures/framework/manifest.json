@@ -1,0 +1,12 @@
+{
+  "models": [
+    "kv4_tied",
+    "kv4_untied",
+    "kv2_tied",
+    "kv2_untied",
+    "kv1_tied",
+    "kv1_untied"
+  ],
+  "reference": "NumPy FP64 batched causal, all prefixes",
+  "seed": 20261009
+}

@@ -1,0 +1,21 @@
+{
+  "note": "Original acquisition URLs recorded by the local validation harness; hashes verified against bundled files.",
+  "files": [
+    {
+      "path": "models/stories260K.bin",
+      "source_url": "https://huggingface.co/karpathy/tinyllamas/resolve/main/stories260K/stories260K.bin",
+      "sha256": "b0a507e7ad0f626624f17112325e66691f9076d622e1d3274d103d00299f2696"
+    },
+    {
+      "path": "tokenizers/tok512.bin",
+      "source_url": "https://huggingface.co/karpathy/tinyllamas/resolve/main/stories260K/tok512.bin",
+      "sha256": "037cb335abb25d1fa9e8ecae30ed2a3a8ace9302862ebcdc05d51a6bbb10c312"
+    },
+    {
+      "path": "../tests/reference/reference_run.c",
+      "source_url": "https://raw.githubusercontent.com/karpathy/llama2.c/master/run.c",
+      "sha256": "9c4f2d5c6ae01b71726d1cc37530d71e60bff0ec7cc012565f16a43c1ca658bd",
+      "license": "../tests/reference/reference_LICENSE"
+    }
+  ]
+}
