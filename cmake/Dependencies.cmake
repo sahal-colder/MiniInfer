@@ -23,10 +23,18 @@ if(INFER_ENABLE_IO_URING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     endif()
 endif()
 
-# SPDK is supplied by the caller's SDK. No fetch, source copy or bundled build.
+# SPDK is built explicitly, from the pinned submodule or an external SDK.
+# Configuring Infer never downloads or compiles optional third-party code.
 if(INFER_ENABLE_SPDK)
     if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
         message(FATAL_ERROR "SPDK requires Linux")
+    endif()
+    set(INFER_SPDK_ROOT "" CACHE PATH "SPDK source/build tree or installed SDK prefix")
+    if(NOT INFER_SPDK_ROOT AND EXISTS "${INFER_RUNTIME_ROOT}/third_party/spdk/build/lib/pkgconfig/spdk_event.pc")
+        set(INFER_SPDK_ROOT "${INFER_RUNTIME_ROOT}/third_party/spdk")
+    endif()
+    if(INFER_SPDK_ROOT)
+        list(PREPEND CMAKE_PREFIX_PATH "${INFER_SPDK_ROOT}" "${INFER_SPDK_ROOT}/build")
     endif()
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(INFER_SPDK REQUIRED

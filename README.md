@@ -14,7 +14,7 @@
 
 Native 和 vLLM 接入复用同一套物理资源与存储实现。vLLM 模式的模型计算、请求调度和 GPU KV BlockPool 仍由 vLLM 提供。
 
-> 当前产品源码以 `main` 分支为准，包含构建配置、必要依赖和本文档。测试、Benchmark、性能日志、模型权重、本地备份和编译产物不随本次产品源码发布。仓库中的 `v2` 是 C ABI 的构建入口，不是另一套独立的逻辑存储引擎。
+> 当前产品源码以 `main` 分支为准，包含构建配置、必要依赖和本文档。测试、Benchmark、性能日志、模型权重、本地备份和编译产物不随本次产品源码发布。C++、C ABI、Native 和 vLLM 接入共用一个逻辑存储核心，统一从根目录构建。
 
 ## 导航
 
@@ -58,7 +58,7 @@ Infer 将这些职责分开：
 | KV Offload | 框架槽绑定、CPU 驻留、SSD 下放、LRU、可选热点保护、预取和副本复用 | 不替代推理框架的请求调度或前缀匹配 |
 | SSD | 定长物理记录槽、有效长度、身份/版本/CRC32C 校验、私有文件分片 | 临时 spill，不是重启恢复或掉电持久化格式 |
 | I/O | POSIX、可选 dlsym / io_uring、可注入字节设备 | 明确请求不可用后端时会返回错误 |
-| SPDK | 可选外部 SDK 后端与设备合同 | 不随仓库内置 SDK；当前硬件环境未完成验证 |
+| SPDK | 可选 SDK 后端与设备合同；官方源码子模块固定提交 | 需要显式构建 SDK；真实 NVMe 直通尚未验证 |
 | Native | 单序列 FP32 Llama、MHA/GQA/MQA、CPU/CUDA、采样和 KV checkpoint | 没有连续批处理或分页 Attention |
 | vLLM | 实验性单 rank connector、批量 DMA、CPU/SSD 分层 | 针对 vLLM 0.31.0、一个 FullAttention KV group 验证 |
 
@@ -126,9 +126,9 @@ flowchart TD
 | Native 推理 | CUDA Toolkit / nvcc；CPU 运行模式同样需要构建此后端 |
 | vLLM 桥接 | CUDA、所选 Python 环境中的 PyTorch、vLLM **0.31.0** |
 | io_uring | 可选系统 liburing、允许 io_uring 的 Linux 内核 |
-| SPDK | 可选外部 SDK、对应 pkg-config 文件和设备配置 |
+| SPDK | 可选；固定提交的官方源码子模块或外部 SDK、对应 pkg-config 文件和设备配置 |
 
-根工程最低 CMake 为 3.18；为统一使用 C ABI 和 `native` CUDA 架构检测，建议直接使用 CMake 3.24+。Ninja 可选。原生 Armadillo 加速可选，未找到时使用标量 CPU 实现。
+所有模块统一要求 CMake 3.24+。Ninja 可选。原生 Armadillo 加速可选，未找到时使用标量 CPU 实现。
 
 Ubuntu / WSL 的基础工具可以安装为：
 
@@ -149,7 +149,7 @@ git clone https://github.com/sahal-colder/MiniInfer.git
 cd MiniInfer
 ```
 
-### 1. 只构建 CPU 存储库
+### 1. 构建 CPU 存储库
 
 ```bash
 cmake -S . -B build-cpu -G Ninja \
@@ -160,7 +160,7 @@ cmake -S . -B build-cpu -G Ninja \
 cmake --build build-cpu --parallel 6
 ```
 
-得到 `infer_memory` 和 `infer_storage` 静态库。CPU-only 构建不会要求 CUDA SDK，不能使用 GPU/Pinned 分配功能。
+得到 `infer_memory`、`infer_storage` 静态库，以及默认启用的 C ABI 和 preload 库。只需 C++ 库时，可关闭 `INFER_BUILD_C_API` 和 `INFER_BUILD_PRELOAD`。CPU-only 构建不会要求 CUDA SDK，不能使用 GPU/Pinned 分配功能。
 
 ### 2. 启用 CUDA 存储库
 
@@ -178,9 +178,10 @@ cmake --build build-cuda --parallel 6
 ### 3. 构建 C ABI
 
 ```bash
-cmake -S v2 -B build-capi -G Ninja \
+cmake -S . -B build-capi -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
-  -DINFER_ENABLE_CUDA=OFF
+  -DINFER_ENABLE_CUDA=OFF \
+  -DINFER_BUILD_C_API=ON
 cmake --build build-capi --parallel 6
 ```
 
@@ -189,7 +190,8 @@ cmake --build build-capi --parallel 6
 只构建 C 物理模块及适配器：
 
 ```bash
-cmake -S v2 -B build-physical -G Ninja \
+cmake -S . -B build-physical -G Ninja \
+  -DINFER_ENABLE_CUDA=OFF \
   -DINFER_BUILD_RUNTIME=OFF \
   -DINFER_BUILD_PRELOAD=OFF
 cmake --build build-physical --parallel 6
@@ -286,9 +288,9 @@ C 头文件不暴露 CUDA、liburing 或 SPDK 结构体，业务通过 opaque ha
 cmake --install build-capi --prefix "$PWD/install-capi"
 ```
 
-C 头安装在 `include/miniinfer/infer/`，避免与 C++ 的 `infer/infer.h` 冲突。C 程序包含 `<infer/runtime.h>` 时，编译增加 `-I<install>/include/miniinfer`，链接 `-L<install>/lib -linfer`，并配置运行期库搜索路径。
+C 头安装在 `include/miniinfer/infer/`，避免与 C++ 的 `infer/infer.h` 冲突。C 程序包含 `<infer/runtime.h>` 时，编译增加 `-I<install>/include/miniinfer`，链接 `-L<install>/lib -linfer`，并配置运行期库搜索路径。使用 CMake 时链接 `Infer::c_api` 会自动提供头文件路径；独立 C 物理模块可链接 `Infer::c_memory` 和 `Infer::device_io`。
 
-`INFER_IO_DLSYM`、`INFER_IO_URING` 控制 C DeviceIO 模块；根工程的 `INFER_ENABLE_IO_URING` 控制 C++ 文件后端。两条构建路径使用不同开关，不要把关闭其中一个理解为删除所有 liburing 依赖。
+`INFER_IO_DLSYM`、`INFER_IO_URING` 控制 C DeviceIO 模块；`INFER_ENABLE_IO_URING` 控制 C++ 文件后端。两个 I/O 模块使用独立开关；关闭其中一个不代表关闭所有 liburing 使用。
 
 `LD_PRELOAD` 分配垫片为可选 glibc 模块；动态符号解析只发生在适配边界，包含一次初始化和递归 bootstrap。它不是业务使用 Storage Runtime 的前提，也不支持在仍有存活分配时热卸载。
 
@@ -431,18 +433,40 @@ print(outputs[0].outputs[0].text)
 | `INFER_BUILD_VLLM` | config.h 默认 OFF | vLLM C++ bridges |
 | `INFER_MEMORY_MODE` | 2 | 0 同步、1 CUDA async、2 缓存池 |
 | `INFER_ENABLE_IO_URING` | ON，依赖可选 | C++ 文件 I/O |
-| `INFER_ENABLE_SPDK` | OFF | 外部 SPDK SDK |
+| `INFER_ENABLE_SPDK` | OFF | 启用 SPDK SDK 后端 |
+| `INFER_SPDK_ROOT` | 空 | SPDK 源码构建树或已安装 SDK 前缀 |
+| `INFER_BUILD_RUNTIME` | ON | 共享 C++ 逻辑存储核心 |
+| `INFER_BUILD_C_API` | ON | C ABI 与独立 C 物理模块 |
+| `INFER_BUILD_PRELOAD` | ON | glibc LD_PRELOAD 分配器 |
 | `MINI_INFER_USE_ARMADILLO` | ON，仅 Native | 可选 CPU 加速 |
 
-| C ABI 构建选项 | 默认 | 含义 |
+| C 物理模块选项（同一根工程） | 默认 | 含义 |
 |---|---|---|
-| `INFER_BUILD_RUNTIME` | ON | 共享逻辑核心与 C 业务 ABI |
-| `INFER_BUILD_PRELOAD` | ON | glibc LD_PRELOAD 分配垫片 |
-| `INFER_ENABLE_CUDA` | OFF | C ABI GPU 资源能力 |
 | `INFER_IO_DLSYM` | ON | RTLD_NEXT 文件适配器 |
 | `INFER_IO_URING` | ON，依赖可选 | C DeviceIO 的 io_uring 实现 |
 
-SPDK 通过系统 pkg-config 引用，不从仓库下载或编译。启用前设置 SDK 的 `PKG_CONFIG_PATH`，再配置 `-DINFER_ENABLE_SPDK=ON`；适配接口见 [`storage_backend.h`](include/infer/storage/storage_backend.h)。
+SPDK 官方源码通过 [`third_party/spdk`](third_party/spdk) 子模块固定到 `v26.09` 的提交 `0bbb7fe4dccfb31e8d446da8822360704949d1e9`，许可证随上游源码保留。普通 CPU、CUDA、C ABI 构建不要求初始化 SPDK，CMake 也不会隐式下载或编译它。
+
+需要 SPDK 时，先初始化源码及所需依赖，按照[固定版本的官方构建说明](https://github.com/spdk/spdk/blob/0bbb7fe4dccfb31e8d446da8822360704949d1e9/README.md#prerequisites)安装系统依赖（包含 liburing 2.3+），再显式构建 SDK：
+
+```bash
+git submodule update --init third_party/spdk
+git -C third_party/spdk submodule update --init dpdk isa-l isa-l-crypto
+cd third_party/spdk
+./configure --with-uring --disable-tests --disable-unit-tests \
+  --disable-examples --disable-apps
+make -j"$(nproc)"
+cd ../..
+
+cmake -S . -B build-spdk -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DINFER_ENABLE_CUDA=OFF \
+  -DINFER_ENABLE_SPDK=ON \
+  -DINFER_SPDK_ROOT="$PWD/third_party/spdk"
+cmake --build build-spdk -j"$(nproc)"
+```
+
+也可将 `INFER_SPDK_ROOT` 指向外部 SDK，或通过 `PKG_CONFIG_PATH` 提供已安装的 SDK。接口见 [`ssd_device.h`](include/infer/storage/ssd_device.h)。选择 bdev、JSON 配置、PCI 绑定及 hugepage 配置由部署方明确指定；构建不会接管系统设备。源码目录、编译生成的 SDK 与真正可用的 NVMe 设备是三个不同条件。
 
 ## 性能与验证状态
 
@@ -467,14 +491,17 @@ DONTNEED 不能驱逐 Windows/VHD/设备缓存，因此第二行不代表物理�
 
 ```text
 MiniInfer/
-├── CMakeLists.txt             # C++ runtime、Native、vLLM 的构建入口
+├── CMakeLists.txt             # 所有产品模块的唯一构建入口
 ├── cmake/                    # 依赖、安装包、Native 构建
 ├── app/                      # 原生生成 CLI
 ├── include/
 │   ├── infer/                # 内存池、Storage、Native 适配 API
+│   ├── c/infer/              # C 公开头（保留原包含和安装路径）
 │   └── mini_infer/           # 原生推理框架 API
 ├── src/
 │   ├── core/ cpu/ cuda/      # 共享物理资源
+│   ├── c_api/                # 共享 Core 的 C ABI、固定槽兼容和 AIO
+│   ├── io/ preload/          # C 设备 I/O 与独立分配垫片
 │   ├── storage/              # Block、Lease、迁移、KV 策略、SSD
 │   └── base/ tensor/ ops/
 │       model/ loader/
@@ -483,11 +510,9 @@ MiniInfer/
 ├── integrations/
 │   ├── native/               # 原生 KV checkpoint
 │   └── vllm/                 # connector、桥接、DMA 与策略
-├── v2/
-│   ├── CMakeLists.txt         # C ABI / 独立 C 模块入口
-│   ├── include/infer/         # C 公开头
-│   └── src/                  # C 物理模块、ABI、共享核心桥接
-└── third_party/crc32c/       # 必要 CRC32C 源码与许可证
+└── third_party/
+    ├── crc32c/               # 必要 CRC32C 源码与许可证
+    └── spdk/                 # 固定提交的官方源码子模块（按需初始化）
 ```
 
 建议按下面顺序阅读产品代码：
@@ -497,7 +522,7 @@ MiniInfer/
 3. [`transfer.cpp`](src/storage/transfer.cpp)：准备、提交、完成、回滚和清理。
 4. [`kv_offload_cache.cpp`](src/storage/kv_offload_cache.cpp)：框架槽绑定与缓存策略。
 5. [`ssd_storage.cpp`](src/storage/ssd_storage.cpp) / [`file_io.cpp`](src/storage/file_io.cpp)：记录布局、校验和定位 I/O。
-6. [`runtime.h`](v2/include/infer/runtime.h)：动态 Block 的 C ABI。
+6. [`runtime.h`](include/c/infer/runtime.h)：动态 Block 的 C ABI。
 7. [`tiered_connector.py`](integrations/vllm/tiered_connector.py)：vLLM CPU/SSD 接入。
 8. [`mini_infer_model.h`](include/mini_infer/model/mini_infer_model.h)：原生推理模型入口。
 

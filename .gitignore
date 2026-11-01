@@ -17,10 +17,6 @@ benchmark-results/
 /examples/
 /docs/
 /tools/
-/v2/tests/
-/v2/bench/
-/v2/tools/
-/third_party/spdk/
 /rewrite-backup-*.tar.gz
 /.env
 /.env.*

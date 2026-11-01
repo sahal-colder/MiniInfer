@@ -1,6 +1,6 @@
 /* 第 4 层：store 之上的异步执行器。一把锁、一张固定大小的作业表、一个按代号先进先出的工作线程。 */
 #include "infer/aio.h"
-#include "../store/lifetime.h"
+#include "lifetime.h"
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>

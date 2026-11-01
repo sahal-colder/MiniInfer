@@ -1,7 +1,7 @@
 /* Fixed scheduler namespace facade over the shared logical storage core. */
 #include "infer/store.h"
 #include "infer/storage/kv_offload_cache.h"
-#include "../runtime/boundary.h"
+#include "boundary.h"
 #include "lifetime.h"
 #include <atomic>
 #include <limits>
