@@ -14,7 +14,7 @@
 
 Native 和 vLLM 接入复用同一套物理资源与存储实现。vLLM 模式的模型计算、请求调度和 GPU KV BlockPool 仍由 vLLM 提供。
 
-> 当前 `dev` 分支发布产品源码、构建配置、必要依赖和本文档。测试、Benchmark、性能日志、模型权重、本地备份和编译产物不随本次产品源码发布。仓库中的 `v2` 是 C ABI 的构建入口，不是另一套独立的逻辑存储引擎。
+> 仓库仅保留 `main` 分支，包含产品源码、构建配置、必要依赖和本文档。测试、Benchmark、性能日志、模型权重、本地备份和编译产物不随本次产品源码发布。仓库中的 `v2` 是 C ABI 的构建入口，不是另一套独立的逻辑存储引擎。
 
 ## 导航
 
@@ -145,7 +145,7 @@ cmake --version
 以下命令均从仓库根目录运行。不同能力使用独立构建目录，避免旧 CMake cache 混用。
 
 ```bash
-git clone --branch dev https://github.com/sahal-colder/MiniInfer.git
+git clone https://github.com/sahal-colder/MiniInfer.git
 cd MiniInfer
 ```
 
