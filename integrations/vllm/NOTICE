@@ -1,0 +1,1 @@
+The experimental connector reuses vLLM 0.31.0 SimpleCPUOffloadConnector and DiskBackend at runtime. Its packed-buffer DMA pipeline is adapted from vllm/v1/simple_kv_offload/disk_backend.py (Apache-2.0, Copyright contributors to the vLLM project). See VLLM-LICENSE. The installed vLLM files are not modified.

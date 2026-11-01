@@ -1,13 +1,13 @@
 #pragma once
 
-#include "mini_infer/ops/embedding/mini_infer_embedding.h"
+#include "mini_infer/ops/mini_infer_embedding.h"
 #include "mini_infer/model/mini_infer_transformer.h"
 
 namespace mini_infer {
 
 // 学习入口：main -> LlamaModel::forward -> TransformerBlock::forward。
 // 一个对象对应一条序列。prefill 逐个消费 prompt token，decode 每次消费
-// 上一步采样出的 token；两者使用同一个 forward，KVCache 持续累积。
+// 上一步采样出的 token；prefill 仅在末尾生成 logits，KVCache 持续累积。
 // 权重、激活和 KV 全部在选择的 CPU/CUDA 设备上；只把最终 logits 读回 CPU。
 // 当前是同步、单序列 FP32 推理，不支持同一对象并发调用。
 class LlamaModel {
@@ -24,9 +24,13 @@ public:
     // 位置自动从 0 增长；越界/非法 token 在计算前拒绝，不改变已有缓存。
     // 计算中途异常后必须 reset 再使用，避免消费只写了一部分层的 KV。
     const Tensor& forward(int32_t token);
+    // 追加非空提示，返回最后一个 token 的 logits；整批先验证，不重置已有 KV。
+    // 中间 token 只推进 decoder，不计算词表投影或把 logits 读回 CPU。
+    const Tensor& prefill(const std::vector<int32_t>& tokens);
     void reset();  // 新请求：清有效长度、复用容量，不重新加载权重。
 
 private:
+    const Tensor& run(const int32_t* tokens, std::size_t count);
     ModelWeights weights_;
     KVCache cache_;
     TransformerWorkspace work_;

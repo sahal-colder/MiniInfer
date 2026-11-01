@@ -1,5 +1,6 @@
 #include "mini_infer/model/mini_infer_model.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace mini_infer {
@@ -34,29 +35,42 @@ LlamaModel::LlamaModel(const std::string& path, std::shared_ptr<DeviceAllocator>
 }
 
 const Tensor& LlamaModel::forward(int32_t token) {
+    return run(&token, 1);
+}
+
+const Tensor& LlamaModel::prefill(const std::vector<int32_t>& tokens) {
+    return run(tokens.data(), tokens.size());
+}
+
+const Tensor& LlamaModel::run(const int32_t* tokens, std::size_t count) {
     if (failed_) throw std::logic_error("previous forward failed; call reset() first");
-    if (token < 0 || token >= config().vocab_size)
-        throw std::out_of_range("token id outside model vocabulary");
-    if (position_ >= config().seq_len)
+    if (!count) throw std::invalid_argument("prefill requires at least one token");
+    if (count > static_cast<std::size_t>(config().seq_len - position_))
         throw std::out_of_range("model context is full; call reset() for a new request");
+    if (std::any_of(tokens, tokens + count,
+                    [&](int32_t token) { return token < 0 || token >= config().vocab_size; }))
+        throw std::out_of_range("token id outside model vocabulary");
     try {
-        // 1. token -> embedding。view 只改变形状，不搬动 hidden 的内存。
-        token_host_.ptr<int32_t>()[0] = token;
-        token_device_.copy_from(token_host_);
-        Tensor embedding_output = hidden_.view(0, {1, config().dim});
-        embedding_.forward(token_device_, embedding_output);
+        cache_.reserve(position_ + static_cast<int32_t>(count));
+        for (std::size_t i = 0; i < count; ++i) {
+            // 同步输入复制保留 token_host_ 的复用契约；中间 token 不返回 logits。
+            token_host_.ptr<int32_t>()[0] = tokens[i];
+            token_device_.copy_from(token_host_);
+            Tensor embedding_output = hidden_.view(0, {1, config().dim});
+            embedding_.forward(token_device_, embedding_output);
 
-        // 2. N 个 decoder block，共享激活工作区，各自拥有独立权重/KV 段。
-        for (int32_t layer = 0; layer < config().layer_num; ++layer)
-            blocks_[layer]->forward(hidden_, cache_, layer, position_, work_);
+            for (int32_t layer = 0; layer < config().layer_num; ++layer)
+                blocks_[layer]->forward(hidden_, cache_, layer,
+                                         position_ + static_cast<int32_t>(i), work_);
+        }
 
-        // 3. 最终 norm + vocabulary projection，输出未归一化的 logits。
+        // 仅提示末尾或当前 decode token 需要词表投影和 CPU logits。
         final_norm_.forward();
         classifier_.forward();
         // CUDA 算子按默认 stream 顺序执行，返回 API 前明确完成 GPU 工作。
         synchronize(hidden_.device_type());
         logits_host_.copy_from(logits_device_);
-        ++position_;
+        position_ += static_cast<int32_t>(count);
         return logits_host_;
     } catch (...) {
         failed_ = true;

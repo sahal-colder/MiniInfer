@@ -1,0 +1,3 @@
+@PACKAGE_INIT@
+include("${CMAKE_CURRENT_LIST_DIR}/Crc32cTargets.cmake")
+check_required_components(Crc32c)

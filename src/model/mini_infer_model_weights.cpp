@@ -1,7 +1,8 @@
 #include "mini_infer/model/mini_infer_model_weights.h"
+#include "mini_infer/base/checked_math.h"
 
-#include "mini_infer/weights/mini_infer_mlp_weight_loader.h"
-#include "mini_infer/weights/mini_infer_qkv_weight_loader.h"
+#include "mini_infer/loader/mini_infer_mlp_weight_loader.h"
+#include "mini_infer/loader/mini_infer_qkv_weight_loader.h"
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -9,14 +10,10 @@
 namespace mini_infer {
 namespace {
 std::size_t add(std::size_t a, std::size_t b) {
-    if (a > std::numeric_limits<std::size_t>::max() - b)
-        throw std::overflow_error("model layout addition overflow");
-    return a + b;
+    return detail::checked_add(a, b, "model layout addition overflow");
 }
 std::size_t multiply(std::size_t a, std::size_t b) {
-    if (b && a > std::numeric_limits<std::size_t>::max() / b)
-        throw std::overflow_error("model layout multiplication overflow");
-    return a * b;
+    return detail::checked_mul(a, b, "model layout multiplication overflow");
 }
 }
 

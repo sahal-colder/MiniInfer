@@ -1,7 +1,7 @@
 #pragma once
 
-#include "mini_infer/ops/add/mini_infer_add.h"
-#include "mini_infer/ops/attention/mini_infer_attention.h"
+#include "mini_infer/ops/mini_infer_add.h"
+#include "mini_infer/ops/mini_infer_attention.h"
 #include "mini_infer/model/mini_infer_model_weights.h"
 
 namespace mini_infer {

@@ -1,5 +1,5 @@
 #include "mini_infer/model/mini_infer_transformer.h"
-#include "mini_infer/ops/rope/mini_infer_rope.h"
+#include "mini_infer/ops/mini_infer_rope.h"
 #include <stdexcept>
 
 namespace mini_infer {

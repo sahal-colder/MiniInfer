@@ -1,8 +1,8 @@
 #pragma once
 
-#include "mini_infer/ops/attention/mini_infer_attention_qkv.h"
-#include "mini_infer/ops/mlp/mini_infer_mlp.h"
-#include "mini_infer/weights/mini_infer_mmap.h"
+#include "mini_infer/model/mini_infer_attention_qkv.h"
+#include "mini_infer/model/mini_infer_mlp.h"
+#include "mini_infer/loader/mini_infer_mmap.h"
 
 namespace mini_infer {
 

@@ -1,0 +1,20 @@
+@PACKAGE_INIT@
+include(CMakeFindDependencyMacro)
+if(@INFER_ENABLE_CUDA@)
+    find_dependency(CUDAToolkit)
+endif()
+find_dependency(Threads)
+find_dependency(Crc32c)
+if(@MINI_INFER_WITH_ARMADILLO@ AND NOT TARGET mini_infer_armadillo)
+    find_dependency(Armadillo)
+    add_library(mini_infer_armadillo INTERFACE IMPORTED)
+    set_target_properties(mini_infer_armadillo PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${ARMADILLO_INCLUDE_DIRS}"
+        INTERFACE_LINK_LIBRARIES "${ARMADILLO_LIBRARIES}")
+endif()
+include("${CMAKE_CURRENT_LIST_DIR}/InferTargets.cmake")
+if(TARGET Infer::mini_infer AND NOT TARGET Infer::native)
+    add_library(Infer::native INTERFACE IMPORTED)
+    set_target_properties(Infer::native PROPERTIES INTERFACE_LINK_LIBRARIES Infer::mini_infer)
+endif()
+check_required_components(Infer)
