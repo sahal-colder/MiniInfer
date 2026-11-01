@@ -142,12 +142,54 @@ cmake --version
 
 ## 快速构建
 
-以下命令均从仓库根目录运行。不同能力使用独立构建目录，避免旧 CMake cache 混用。
+推荐使用下面的统一配置入口。后续 CMake 命令保留给需要单独链接库、安装 SDK 或管理编译选项的调用者。
 
 ```bash
 git clone https://github.com/sahal-colder/MiniInfer.git
 cd MiniInfer
 ```
+
+### 统一配置与启动
+
+修改根目录 [`infer.conf`](infer.conf)，再用 [`app/infer.py`](app/infer.py) 构建和启动。配置方式参考本地 kvstore 的实际 `kvs_config`：`key value`、空行、`#` 注释和引号；不执行变量展开或 shell 表达式。仅需 Python 3.10+ 标准库，配置检查不会导入 PyTorch/vLLM，也不会创建缓存或构建目录。
+
+```text
+framework native
+cuda yes
+device cuda
+memory-mode pool
+model /path/to/model.bin
+tokenizer /path/to/tokenizer.bin
+prompt "Explain KV cache"
+max-tokens 64
+```
+
+```bash
+python3 app/infer.py --check-config
+python3 app/infer.py --print-config
+python3 app/infer.py build
+python3 app/infer.py run
+```
+
+改用 vLLM 时，在同一个文件中设置 `framework vllm`，将 `model` 改为 Hugging Face 模型目录或 ID，`tokenizer ""` 使用模型自带 Tokenizer。`storage-engine` 可选 `posix`、`uring`、`auto` 或 `spdk`；CPU/SSD 预算和 I/O 并发也在此文件配置。vLLM/PyTorch 安装在运行该脚本的同一个 Python 环境中；桥接编译自动使用这个解释器。
+
+配置优先级为 **默认值 → 配置文件 → `--key value`**，CLI 参数位置不影响覆盖顺序。所有配置项均可直接覆盖；自定义文件使用 `--config /path/to/infer.conf`，相对文件路径以该配置文件所在目录为基准。比如临时切换框架、预览命令：
+
+```bash
+python3 app/infer.py build --framework vllm --storage-engine uring
+python3 app/infer.py run --framework vllm --storage-engine uring \
+  --model /path/to/huggingface-model --tokenizer "" --dry-run
+```
+
+`--print-config` 输出生效配置的 JSON，供检查使用。`--dry-run` 只输出配置产生的构建命令或启动参数，不编译、不下载模型、不初始化 GPU。`framework storage` 只构建存储库，配合 `cuda no` 可构建 CPU 产品；库调用仍使用 C/C++ API。直接使用 CMake 时不会读取 `infer.conf`。
+
+配置只在构建、启动阶段读取，不进入分配、I/O 或推理热路径。改变框架、CUDA 能力、内存模式或增加后端后先重新执行 `build`；启动时会核对已有构建配置，显式后端不可用会报错。vLLM 入口会用配置中的值组装现有 connector，不再受继承的 `MINIINFER_*` 环境变量影响；直接使用原 connector 的环境变量接口仍保留。
+
+配置中已标注 vLLM 专属字段：自动 CPU/SSD offload、DMA 窗口和模型执行预算。Native CLI 的 KV checkpoint 仍通过显式 `KVCacheStorage` API 使用；该 CLI 不会因设置存储预算而自动 offload。`memory-mode` 选择 MiniInfer 自身 CUDA 分配器的实现，不改写 vLLM/PyTorch 的 GPU 分配器。
+
+统一配置的 `ssd-bytes` 是物理记录预算。connector 在模型 KV 布局确定后扣除每槽的容量取整、64 字节头部及设备对齐，再计算逻辑槽数；SPDK 区域不会被载荷预算超配。Pinned DMA 窗口与操作系统文件页缓存不包含在这个 SSD 数字中。直接使用旧 connector 的 `disk_capacity_bytes` 载荷合同保持不变；新的物理预算通过 `miniinfer_ssd_bytes` 明确传入。
+
+普通构建使用 CMake 3.24+、Ninja 和配置中指定的 `jobs`；如果 CMake 不在默认 PATH，可以设置 `cmake /absolute/path/to/cmake`。SPDK 的源码初始化和 SDK 构建要求见后文。
 
 ### 1. 构建 CPU 存储库
 
@@ -424,7 +466,7 @@ print(outputs[0].outputs[0].text)
 
 ## 构建选项
 
-优先使用 CMake 开关；[`include/infer/config.h`](include/infer/config.h) 提供默认值。配置变更后重新配置相应构建目录。安装包会导出本次构建的宏配置，不能只修改消费者宏来切换已经编译的库。
+产品构建和启动优先修改 [`infer.conf`](infer.conf)。下表为高级调用者直接使用的 CMake 开关；[`include/infer/config.h`](include/infer/config.h) 保留 C++ 宏与兼容默认值，生成头文件记录实际编译能力。安装包会导出本次构建的宏配置，不能只修改消费者宏来切换已经编译的库。
 
 | 根工程选项 | 默认 | 含义 |
 |---|---|---|
@@ -492,8 +534,9 @@ DONTNEED 不能驱逐 Windows/VHD/设备缓存，因此第二行不代表物理�
 ```text
 MiniInfer/
 ├── CMakeLists.txt             # 所有产品模块的唯一构建入口
+├── infer.conf                # 框架、引擎、模型与预算的统一用户配置
 ├── cmake/                    # 依赖、安装包、Native 构建
-├── app/                      # 原生生成 CLI
+├── app/                      # 统一配置启动器与原生生成 CLI
 ├── include/
 │   ├── infer/                # 内存池、Storage、Native 适配 API
 │   ├── c/infer/              # C 公开头（保留原包含和安装路径）

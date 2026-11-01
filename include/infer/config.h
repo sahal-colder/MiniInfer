@@ -1,7 +1,8 @@
 #pragma once
 
-// Edit these defaults, then configure CMake in a fresh build directory.
-// A configured/installed library supplies its exact settings here.
+// Build macros, not the product startup configuration. Use infer.conf with
+// app/infer.py; advanced builds may pass CMake options directly.
+// A configured/installed library supplies its exact compiled capabilities here.
 #if __has_include("infer/build_config.h")
 #include "infer/build_config.h"
 #endif

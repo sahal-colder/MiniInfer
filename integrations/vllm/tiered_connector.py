@@ -5,14 +5,19 @@ CPU/SSD placement through TieredStorage. No installation files are patched.
 """
 
 import ctypes
-from functools import partial
 import os
-from pathlib import Path
 import types
+from functools import partial
+from pathlib import Path
 
 from admission import CapacityAdmission, FrequencyAdmission, install_admission
-from host_budget import host_cache_budget, pool_usable_budget, kv_slot_bytes
 from cache_cost import CacheCostModel, release_pending_hit
+from host_budget import (
+    host_cache_budget,
+    kv_slot_bytes,
+    pool_usable_budget,
+    ssd_payload_capacity,
+)
 from miniinfer_connector import (
     MiniInferConnector,
     MiniInferDiskBackend,
@@ -161,6 +166,15 @@ class MiniInferTieredConnector(MiniInferConnector):
         groups = kv_cache_config.kv_cache_groups
         if len(groups) != 1 or not isinstance(groups[0].kv_cache_spec, FullAttentionSpec):
             raise ValueError("Tiered admission supports one FullAttention KV group")
+        if "miniinfer_ssd_bytes" in extra:
+            payload = sum(t.size for t in kv_cache_config.kv_cache_tensors) // kv_cache_config.num_blocks
+            capacity = ssd_payload_capacity(
+                extra["miniinfer_ssd_bytes"], payload,
+                os.environ.get("MINIINFER_COMPACT_SLOTS", "0") == "1",
+                4096 if os.environ.get("MINIINFER_SPDK_BDEV") else 1,
+            )
+            extra["disk_capacity_bytes"] = capacity
+            extra["cpu_bytes_to_use"] = capacity
         cpu_bytes = extra.get("miniinfer_cpu_bytes", 512 * 1024**2)
         if type(cpu_bytes) is not int or cpu_bytes <= 0:
             raise ValueError("miniinfer_cpu_bytes must be a positive integer")

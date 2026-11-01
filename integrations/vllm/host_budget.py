@@ -24,6 +24,18 @@ def kv_slot_bytes(payload, compact=False):
     return max(4096, 1 << (payload - 1).bit_length())
 
 
+def ssd_payload_capacity(total, payload, compact=False, alignment=1):
+    """Translate a physical SSD budget to vLLM payload capacity, including headers."""
+    if type(total) is not int or not 0 < total <= (1 << 63) - 1:
+        raise ValueError("SSD budget must be a positive byte count")
+    record = kv_slot_bytes(payload, compact) + 64
+    record = (record + alignment - 1) // alignment * alignment
+    slots = total // record
+    if slots < 2:
+        raise ValueError("SSD budget must hold a null slot and one reusable physical KV slot")
+    return slots * payload
+
+
 def host_cache_budget(total, payload, buffer_slots, pooled, compact=False, device_reserved=0):
     if type(device_reserved) is not int or device_reserved < 0:
         raise ValueError("Invalid SSD device reservation")
