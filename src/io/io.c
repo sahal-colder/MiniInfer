@@ -101,6 +101,26 @@ int if_dev_open_fd(int fd, uint64_t size, int own, if_dev **out) {
     return if_dev_open_fd_backend(IF_IO_POSIX, fd, size, own, out);
 }
 
+int if_dev_open_uring_fd(int fd, uint64_t size, int own, unsigned depth,
+                         const struct iovec *buffers, unsigned count, if_dev **out) {
+    if (!out)
+        return -EINVAL;
+    *out = NULL;
+    if (fd < 0 || !size || !depth || depth > 64 || count > UINT16_MAX || (count && !buffers))
+        return -EINVAL;
+    if (size > (uint64_t)INT64_MAX)
+        return -EFBIG;
+#ifdef IF_HAVE_URING
+    int saved = errno;
+    int rc = if_uring_open_configured(fd, size, own, depth, buffers, count, out);
+    errno = saved;
+    return rc;
+#else
+    (void)own;
+    return -ENOTSUP;
+#endif
+}
+
 int if_dev_open_tmp(const char *dir, uint64_t size, if_dev **out) {
     return if_dev_open_tmp_backend(IF_IO_POSIX, dir, size, out);
 }

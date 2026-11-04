@@ -7,7 +7,7 @@
  * 约定：成功返回 0，失败返回 -errno。
  *   -EINVAL  参数错：NULL，或缓冲为 NULL 而长度非零
  *   -ERANGE  请求超出设备范围（含算术溢出）；整批请求一个都不执行
- *   其他     来自后端；批内按顺序执行，遇到第一个错误就停止，已完成的请求保持完成
+ *   其他     来自后端；默认批内按顺序执行，遇到第一个错误就停止
  * 公共入口保留调用者 errno，以返回值传错。
  */
 #ifndef INFER_IO_H
@@ -59,6 +59,15 @@ typedef enum if_io_backend {
  * by the caller. Legacy open functions select POSIX. */
 IF_API int if_dev_open_tmp_backend(if_io_backend backend, const char *dir, uint64_t size, if_dev **out);
 IF_API int if_dev_open_fd_backend(if_io_backend backend, int fd, uint64_t size, int own, if_dev **out);
+
+struct iovec;
+/* Open a ring with 1..64 SQEs per batch. With depth > 1, requests must have
+ * disjoint write offsets or read destinations. Already submitted requests may
+ * complete after a peer fails. All completions are drained before return.
+ * Optional fixed buffers must be 4 KiB aligned in address and length and live
+ * until close. Registration failure is reported as an open failure. */
+IF_API int if_dev_open_uring_fd(int fd, uint64_t size, int own, unsigned depth,
+                               const struct iovec *buffers, unsigned count, if_dev **out);
 
 /* 私有临时文件：建在 dir 下，立刻 unlink，关闭或进程退出后自动消失；稀疏，未写区域读出为零。
  * size 必须在 1..INT64_MAX。失败时 *out = NULL。 */

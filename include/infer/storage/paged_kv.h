@@ -62,6 +62,7 @@ class PagedKV {
     // One authoritative completion wait, then commit/release distinct same-stream leases.
     static void finish_many(std::vector<PageLease>&);
     // Per-layer prefetch/offload. At most 64 pages per bounded migration job.
+    // Aligned SSD backends coalesce adjacent physical records within that job.
     // Resident targets are skipped; a busy source raises StorageBusy.
     Ticket prefetch_layer(const Sequence&, std::size_t layer,
                           StorageLocation target = StorageLocation::GPU,

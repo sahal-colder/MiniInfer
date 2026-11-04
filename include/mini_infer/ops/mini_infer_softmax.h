@@ -38,6 +38,7 @@ void check_softmax_tensors(const Tensor&, const Tensor&, DeviceType);
 void softmax_rows_cpu(const float* input, float* output, std::size_t rows,
                       int32_t width, int32_t stride);
 void softmax_rows_cuda(const float* input, float* output, std::size_t rows,
-                       int32_t width, int32_t stride, cudaStream_t stream);
+                       int32_t width, int32_t stride, cudaStream_t stream,
+                       const int32_t* device_position = nullptr);
 }  // namespace detail
 }  // namespace mini_infer

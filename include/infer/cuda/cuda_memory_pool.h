@@ -10,6 +10,8 @@
 
 struct CUstream_st;
 typedef struct CUstream_st* cudaStream_t;
+struct CUgraph_st;
+typedef struct CUgraph_st* cudaGraph_t;
 
 namespace infer {
 
@@ -22,7 +24,7 @@ struct CachingCUDAAllocatorConfig {
     std::size_t min_split_bytes = 256;
     std::size_t graph_max_allocations = 4096;
     // Requests >= 16 MiB use this granularity; 0 retains geometric rounding.
-    std::size_t large_allocation_granularity = 2ULL * 1024 * 1024;
+    std::size_t large_allocation_granularity = 0;
 };
 
 class CachingCUDADeviceAllocator final : public DeviceAllocator {
@@ -44,6 +46,9 @@ class CachingCUDADeviceAllocator final : public DeviceAllocator {
     StreamId register_stream(cudaStream_t stream, StreamId id = 0) const;
     void unregister_stream(cudaStream_t stream) const;
 
+    // Shared private scratch: captures restart at its base. Callers must order
+    // all replays on one stream (or fence them), with no overlapping lifetimes
+    // for aliased intermediates. Eager requests and trim never touch scratch.
     void reserve_graph_workspace(std::size_t bytes) const;
     void begin_graph_capture(GraphId graph_id, cudaStream_t stream) const;
     void end_graph_capture(GraphId graph_id) const;
@@ -63,3 +68,27 @@ class CachingCUDADeviceAllocator final : public DeviceAllocator {
 };
 
 } // namespace infer
+
+#if INFER_ENABLE_CUDA
+namespace infer {
+// Owns both capture state machines. The caller owns the returned graph and
+// must destroy its executables before forget_graph() or allocator destruction.
+class GraphCaptureScope {
+  public:
+    GraphCaptureScope(const CachingCUDADeviceAllocator& allocator,
+                      CachingCUDADeviceAllocator::GraphId id, cudaStream_t stream);
+    ~GraphCaptureScope();
+    GraphCaptureScope(const GraphCaptureScope&) = delete;
+    GraphCaptureScope& operator=(const GraphCaptureScope&) = delete;
+    cudaGraph_t finish();
+
+  private:
+    const CachingCUDADeviceAllocator& allocator_;
+    CachingCUDADeviceAllocator::GraphId id_;
+    cudaStream_t stream_;
+    cudaGraph_t graph_ = nullptr;
+    bool active_ = true;
+    bool capturing_ = false;
+};
+} // namespace infer
+#endif

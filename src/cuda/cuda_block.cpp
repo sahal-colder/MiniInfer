@@ -146,23 +146,7 @@ bool whole_segment(const Block& block) noexcept {
  * @throw std::overflow_error 如果字节数超过池支持的最大 bin 范围。
  */
 std::pair<unsigned, std::size_t> bucket(std::size_t bytes) {
-    constexpr auto alignment = CachingCUDADeviceAllocator::allocation_alignment;
-    std::size_t capacity = alignment;
-    std::size_t step = alignment;
-    for (unsigned i = 0; i < bin_count; ++i) {
-        if (capacity >= bytes) {
-            return {i, capacity};
-        }
-        // 1 KiB 之后，每个 2 的幂区间分成四档；保留原尺寸序列。
-        if (capacity >= 1024 && (capacity & (capacity - 1)) == 0) {
-            step = capacity / 4;
-        }
-        if (capacity > SIZE_MAX - step) {
-            break;
-        }
-        capacity += step;
-    }
-    throw std::overflow_error("CUDA pool bucket capacity overflow");
+    return size_classes::bucket(bytes, 8);
 }
 
 /**

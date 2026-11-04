@@ -15,10 +15,14 @@ struct PagedModelConfig {
     infer::FileIOConfig ssd_io{infer::FileIOMode::IO_URING};
     infer::SpdkBdevConfig ssd_spdk;
     bool ssd_direct=true, ssd_read_back=false;
+    // Two streaming slots, or persistent per-layer slots when resident_layers
+    // is zero and the GPU budget covers them. Prefix publication flushes KV.
+    bool enable_async_kv_pipeline=false;
 };
 struct ModelOptions {
     ModelKVMode kv_mode=ModelKVMode::AUTO; // CUDA: paged; CPU: contiguous.
     PagedModelConfig paged;
+    bool enable_cuda_graph=false; // Requires the fixed-slot async KV pipeline.
 };
 struct PagedModelStats {
     std::uint64_t computed_tokens=0,prefix_hit_tokens=0,last_prefix_hit_tokens=0;
@@ -30,6 +34,7 @@ struct PagedModelStats {
     std::size_t gpu_reserved_bytes=0,host_reserved_bytes=0,ssd_reserved_bytes=0;
     std::size_t gpu_peak_bytes=0,host_peak_bytes=0,ssd_peak_bytes=0,staging_bytes=0;
     std::uint64_t ssd_read_bytes=0,ssd_written_bytes=0,ssd_record_writes=0,uring_submissions=0;
+    std::uint64_t host_read_bytes=0,host_written_bytes=0;
     infer::SSDDeviceStats ssd_device;
 };
 }

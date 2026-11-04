@@ -77,7 +77,9 @@ function(infer_add_runtime root)
         ${INFER_RUNTIME_ROOT}/src/storage/transfer.cpp
     )
     if(INFER_ENABLE_CUDA)
-        target_sources(infer_storage PRIVATE ${INFER_RUNTIME_ROOT}/src/storage/gpu_storage.cpp)
+        target_sources(infer_storage PRIVATE
+            ${INFER_RUNTIME_ROOT}/src/storage/async_kv_pipeline.cpp
+            ${INFER_RUNTIME_ROOT}/src/storage/gpu_storage.cpp)
         target_sources(infer_io PRIVATE ${INFER_RUNTIME_ROOT}/src/io/weight_io.cpp)
         target_link_libraries(infer_io PRIVATE CUDA::cuda_driver)
         if(INFER_BUILD_PAGED_KERNELS OR INFER_BUILD_NATIVE)

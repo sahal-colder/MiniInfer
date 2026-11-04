@@ -65,6 +65,8 @@ class CachingCPUDeviceAllocator final : public DeviceAllocator {
      * @return void* 对齐到 64 字节的内存首地址
      */
     void* allocate(std::size_t size, cudaStream_t stream = nullptr) const override;
+    // Uses the same budget/cache. Requires the built-in CPU or pinned upstream.
+    void* allocate_io(std::size_t size) const;
 
     /**
      * @brief 将内存归还给内存池（放入空闲缓存或退回上游）

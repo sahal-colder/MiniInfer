@@ -150,8 +150,11 @@ class CachingCUDADeviceAllocator::Impl {
                 }
             }
         }
-        if (graphs_.workspace()) {
+        if (graphs_.workspace() && !stats_.graph_count) {
             cudaFree(graphs_.workspace());
+        }
+        if (stats_.graph_count) {
+            std::fputs("CUDA pool destroyed with live graphs; private workspace retained\n", stderr);
         }
         streams_.destroy_events();
         if (previous >= 0 && previous != device) {
@@ -184,6 +187,14 @@ class CachingCUDADeviceAllocator::Impl {
         }
 
         // 4. cudaMalloc fallback：预算不足先 trim，OOM 时保留原来的一次 trim/重试。
+        // Amortize upstream CUDA calls with splittable segments. Explicit
+        // budgets and cache limits still cap the physical reservation.
+        const auto segment_target = capacity <= (1ULL << 20) ? (2ULL << 20) : (16ULL << 20);
+        const auto segment_capacity = config_.min_split_bytes &&
+                segment_target <= config_.max_cached_bytes &&
+                (!config_.max_reserved_bytes || segment_target <= config_.max_reserved_bytes -
+                    std::min(config_.max_reserved_bytes,stats_.reserved_bytes))
+            ? std::max<std::size_t>(capacity,segment_target) : capacity;
         if (exceeds_budget(capacity)) {
             trim_unlocked();
             // 等待后可能只得到 ready 子块，active 邻居使 segment 无法整体释放。
@@ -194,14 +205,15 @@ class CachingCUDADeviceAllocator::Impl {
         if (exceeds_budget(capacity)) {
             throw std::bad_alloc();
         }
-        if (stats_.reserved_bytes > SIZE_MAX - capacity) {
+        if (stats_.reserved_bytes > SIZE_MAX - segment_capacity) {
             throw std::overflow_error("CUDA pool total capacity overflow");
         }
         // 先预留主机节点和哈希桶，避免显存申请成功后才发生主机登记失败。
         blocks_.try_emplace(nullptr);
         void* ptr = nullptr;
+        auto allocated_capacity = segment_capacity;
         try {
-            auto err = cudaMalloc(&ptr, capacity);
+            auto err = cudaMalloc(&ptr, segment_capacity);
             if (err == cudaErrorMemoryAllocation) {
                 ++stats_.oom_retries;
                 trim_unlocked();
@@ -210,7 +222,10 @@ class CachingCUDADeviceAllocator::Impl {
                     blocks_.erase(nullptr);
                     return activate(*block, bytes, capacity, stream);
                 }
-                err = cudaMalloc(&ptr, capacity);
+                // Slabs are a reuse preference, never a minimum free-VRAM
+                // requirement for an otherwise satisfiable allocation.
+                allocated_capacity = capacity;
+                err = cudaMalloc(&ptr, allocated_capacity);
             }
             if (err == cudaErrorMemoryAllocation) {
                 throw std::bad_alloc();
@@ -224,18 +239,22 @@ class CachingCUDADeviceAllocator::Impl {
         node.key() = ptr;
         auto& block = node.mapped();
         block.ptr = ptr;
-        block.capacity = capacity;
+        block.capacity = allocated_capacity;
         block.requested = bytes;
-        block.bin = bin;
+        block.bin = free_bin(allocated_capacity);
         block.owner = &stream;
         // C++17 node handle：复用预留节点；桶容量已足够，指针 hash/equality 不抛异常。
         blocks_.insert(std::move(node));
-        stats_.active_requested_bytes += bytes;
-        stats_.active_capacity_bytes += capacity;
-        account_reserve(capacity);
-        ++stats_.active_blocks;
+        auto& reserved = blocks_.at(ptr);
+        reserved.state = State::ready;
+        add_bin(ready_,reserved);
+        stats_.ready_bytes += allocated_capacity;
+        ++stats_.ready_blocks;
+        account_reserve(allocated_capacity);
         ++stats_.segments;
-        return ptr;
+        auto* result = activate(reserved,bytes,capacity,stream);
+        --stats_.reuse_count; // An upstream segment is not a reuse hit.
+        return result;
     }
 
     void release(void* ptr, cudaStream_t handle) {
@@ -254,8 +273,10 @@ class CachingCUDADeviceAllocator::Impl {
         Stream& stream = streams_.stream(handle);
         Block& block = it->second;
         const auto cached = stats_.pending_bytes + stats_.ready_bytes;
-        if (whole_segment(block) && (block.capacity > config_.max_cached_bytes ||
-                                     cached > config_.max_cached_bytes - block.capacity)) {
+        // A dedicated pool whose entire reservation fits in the cache can
+        // retire every allocation through events, including its last segment.
+        if (stats_.reserved_bytes > config_.max_cached_bytes && whole_segment(block) &&
+            (cached > config_.max_cached_bytes || block.capacity > config_.max_cached_bytes - cached)) {
             // 缓存上限分支沿用原同步释放；失败前不撤销调用者的 active 所有权。
             check_cuda(cudaStreamSynchronize(handle), "pool cache limit wait");
             ++stats_.completion_waits;
@@ -451,6 +472,41 @@ void CachingCUDADeviceAllocator::trim() const {
 }
 CUDAMemoryPoolStats CachingCUDADeviceAllocator::stats() const {
     return impl_->stats();
+}
+
+GraphCaptureScope::GraphCaptureScope(const CachingCUDADeviceAllocator& allocator,
+                                   CachingCUDADeviceAllocator::GraphId id, cudaStream_t stream)
+    : allocator_(allocator), id_(id), stream_(stream) {
+    allocator_.begin_graph_capture(id_, stream_);
+    const auto error = cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal);
+    if (error != cudaSuccess) {
+        allocator_.abort_graph_capture(id_);
+        check_cuda(error, "begin graph capture");
+    }
+    capturing_ = true;
+}
+
+GraphCaptureScope::~GraphCaptureScope() {
+    if (capturing_) cudaStreamEndCapture(stream_, &graph_);
+    if (graph_) cudaGraphDestroy(graph_);
+    if (!active_) return;
+    try {
+        allocator_.abort_graph_capture(id_);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "Abort graph capture: %s\n", error.what());
+    }
+}
+
+cudaGraph_t GraphCaptureScope::finish() {
+    if (!active_ || !capturing_) throw std::logic_error("Graph capture is already finished");
+    const auto error = cudaStreamEndCapture(stream_, &graph_);
+    capturing_ = false;
+    check_cuda(error, "end graph capture");
+    allocator_.end_graph_capture(id_);
+    active_ = false;
+    const auto graph = graph_;
+    graph_ = nullptr;
+    return graph;
 }
 
 } // namespace infer

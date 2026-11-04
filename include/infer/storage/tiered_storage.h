@@ -118,7 +118,7 @@ class TieredStorage {
     // 一次提交 1..64 个不同 ID，共用一个任务/future，结果顺序与输入相同。
     // 提交时全部保护源并预留目标预算；参数/Busy/预算失败则整批撤销预留。
     // 执行时逐块提交，不是整批原子事务；普通失败不阻止后续块。
-    // GPU 批次独占一个 Pinned 槽并顺序复用；DMA 完成未知时停止本批，
+    // GPU 批次独占一个 Pinned 槽；对齐 SSD 可在槽内中转多页。DMA 完成未知时停止本批，
     // 撤销尚未执行块的预留，故障块的资源仍由 retry_cleanup/erase 回收。
     std::future<std::vector<MigrationResult>> migrate_batch_async(const std::vector<BlockId>& ids,
                                                                   StorageLocation target);

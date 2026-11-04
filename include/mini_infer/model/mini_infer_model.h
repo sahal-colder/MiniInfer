@@ -2,13 +2,14 @@
 
 #include "mini_infer/model/mini_infer_transformer.h"
 #include "mini_infer/model/mini_infer_model_options.h"
+#include "mini_infer/model/mini_infer_cuda_graph.h"
 
 namespace mini_infer {
 class PagedModelCache;
 
 // 学习入口：main -> LlamaModel::forward -> TransformerBlock::forward。
-// 一个对象对应一条序列。prefill 逐个消费 prompt token，decode 每次消费
-// 上一步采样出的 token；prefill 仅在末尾生成 logits，KV 持续累积。
+// 一个对象对应一条序列。prefill 按层批量消费未命中的 prompt tokens；
+// decode 每次消费一个 token。只有最后一行产生 CPU logits。
 // CUDA 默认使用三级 Paged KV 和跨请求前缀共享，CPU 使用连续 KV。
 // 权重和激活在选择的设备上；最终 logits 读回 CPU。
 // 当前是同步、单序列 FP32 推理，不支持同一对象并发调用。
@@ -19,6 +20,7 @@ public:
     ~LlamaModel();
     bool uses_paged_kv() const noexcept { return bool(paged_); }
     PagedModelStats paged_stats() const;
+    CUDAGraphStats cuda_graph_stats() const;
     const infer::io::LoadStats& weight_io_stats() const noexcept { return weights_.loading; }
     LlamaModel(const LlamaModel&) = delete;
     LlamaModel& operator=(const LlamaModel&) = delete;
@@ -46,6 +48,10 @@ private:
     RMSNormLayer final_norm_;
     MatmulLayer classifier_;
     Tensor hidden_, logits_device_, logits_host_;
+    std::unique_ptr<CUDAGraphRunner> graphs_;
+    std::shared_ptr<DeviceAllocator> allocator_;
+    std::unique_ptr<TransformerWorkspace> prefill_work_;
+    Tensor prefill_hidden_, prefill_ids_;
     int32_t position_ = 0;
     bool failed_ = false;
 };

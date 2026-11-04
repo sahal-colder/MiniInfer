@@ -56,18 +56,26 @@ struct MigrationExecutor::Impl {
     }
     void run_batch(Batch& batch) {
         bool quarantined = false;
-        for (std::size_t i = 0; i < batch.records.size(); ++i) {
-            auto* record = batch.records[i];
+        for (std::size_t i = 0; i < batch.records.size();) {
+            if (!quarantined) {
+                const auto end = execute_chunk_batch(*state, batch.records, batch.results, i, quarantined);
+                if (end != i) {
+                    i = end;
+                    continue;
+                }
+            }
+            const auto index = i++;
+            auto* record = batch.records[index];
             if (!record) {
-                batch.results[i].committed = true;
+                batch.results[index].committed = true;
                 continue;
             }
             if (quarantined) {
                 std::lock_guard<std::mutex> lock(state->mutex);
                 cancel_prepared(*state, *record);
-                batch.results[i].error = batch.stopped;
+                batch.results[index].error = batch.stopped;
             } else {
-                batch.results[i] = execute_transfer(*state, *record, &quarantined);
+                batch.results[index] = execute_transfer(*state, *record, &quarantined);
             }
             // execute_transfer 已交回该块的使用权，之后不能再解引用这个指针。
         }

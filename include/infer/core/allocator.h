@@ -22,6 +22,11 @@
 
 namespace infer {
 
+inline constexpr std::size_t io_alignment = 4096;
+// Rounded I/O length for allocate_io(). Address and usable length are 4 KiB
+// aligned. Release with the allocator's usual release().
+std::size_t io_allocation_size(std::size_t bytes);
+
 enum class DeviceType { UNKNOWN, CPU, CUDA };
 enum class MemcpyKind { CPU2CPU, CPU2CUDA, CUDA2CPU, CUDA2CUDA };
 
@@ -50,6 +55,7 @@ class CPUDeviceAllocator final : public DeviceAllocator {
     CPUDeviceAllocator();
 
     void* allocate(std::size_t size, cudaStream_t stream = nullptr) const override;
+    void* allocate_io(std::size_t size) const;
     void release(void* ptr, cudaStream_t stream = nullptr) const override;
 };
 
@@ -62,6 +68,7 @@ class PinnedHostAllocator final : public DeviceAllocator {
     PinnedHostAllocator();
 
     void* allocate(std::size_t size, cudaStream_t stream = nullptr) const override;
+    void* allocate_io(std::size_t size) const;
     void release(void* ptr, cudaStream_t stream = nullptr) const override;
 };
 

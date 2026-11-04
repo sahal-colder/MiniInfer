@@ -33,6 +33,7 @@ add_library(mini_infer_compute
     src/ops/cuda/mini_infer_embedding.cu
     src/ops/cuda/mini_infer_kernels_cuda.cu
     src/ops/cuda/mini_infer_kv_cache_kernel.cu
+    src/ops/cuda/mini_infer_prefill.cu
     src/ops/cuda/mini_infer_matmul_backend.cu
     src/ops/cuda/mini_infer_quantized_sgemv.cu
     src/ops/cuda/mini_infer_rope.cu

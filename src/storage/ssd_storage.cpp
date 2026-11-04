@@ -1,4 +1,5 @@
 #include "crc32c/crc32c.h"
+#include "infer/cpu/cpu_memory_pool.h"
 #include "infer/storage/storage_backend.h"
 #include "slot_table.h"
 
@@ -231,6 +232,10 @@ struct SSDStorageBackend::Impl {
     struct Allocation {
         mutable std::mutex mutex;
         std::size_t slot = 0, written = 0;
+        // The logical page maps to this record within a submitted chunk.
+        // Length and checksum remain in meta.size and crc.
+        std::uint64_t chunk_lba = 0;
+        std::size_t chunk_offset = 0;
         std::uint32_t crc = ~0u;
         bool sealed = false;
         bool released = false;
@@ -242,6 +247,8 @@ struct SSDStorageBackend::Impl {
     std::string pending_file;
     std::size_t payload = 0, record = 0, max_slots = 0;
     std::size_t payload_offset = record_header_bytes;
+    std::size_t sector = 1;
+    CachingCPUDeviceAllocator chunk_pool;
     // Aligned device records share immutable zero padding; only their 64-byte
     // identity headers scale with the bounded batch. Files keep their v1 layout.
     std::vector<unsigned char> metadata_padding;
@@ -337,7 +344,105 @@ struct SSDStorageBackend::Impl {
     }
     off_t offset(const Allocation& allocation) const {
         // 构造时已限制 file budget <= off_t::max，slot < max_slots。
-        return static_cast<off_t>(allocation.slot * record);
+        return static_cast<off_t>(allocation.chunk_lba * sector + allocation.chunk_offset);
+    }
+    // Group only adjacent, full records. Holes and short records keep their own
+    // ranges so a chunk never writes another page's sector or reads unused tails.
+    void device_batch(bool write, const std::vector<FileIORequest>& ranges,
+                      const std::vector<std::shared_ptr<Allocation>>& entries,
+                      std::vector<std::size_t> order) {
+        if (metadata_padding.empty() || order.size() < 2 || record > 1024 * 1024) {
+            if (write) device->write_many(ranges);
+            else device->read_many(ranges);
+            return;
+        }
+        std::sort(order.begin(), order.end(), [&](auto a, auto b) {
+            return ranges[2 * a].offset < ranges[2 * b].offset;
+        });
+        struct Chunk {
+            std::shared_ptr<void> buffer;
+            std::size_t first, end;
+        };
+        std::vector<FileIORequest> wave;
+        wave.reserve(ranges.size());
+        std::vector<Chunk> chunks;
+        chunks.reserve(4);
+        for (std::size_t first = 0; first < order.size();) {
+            wave.clear();
+            chunks.clear();
+            while (first < order.size() && chunks.size() < 4) {
+                const auto i = order[first];
+                const auto base = ranges[2 * i].offset;
+                auto end = first + 1;
+                while (ranges[2 * i + 1].bytes == payload && end < order.size() &&
+                       end - first < (2 * 1024 * 1024) / record) {
+                    const auto next = order[end];
+                    if (ranges[2 * next].offset != base + (end - first) * record ||
+                        ranges[2 * next + 1].bytes != payload)
+                        break;
+                    ++end;
+                }
+                if (end - first == 1) {
+                    wave.push_back(ranges[2 * i]);
+                    wave.push_back(ranges[2 * i + 1]);
+                    first = end;
+                    continue;
+                }
+                const bool scatter = std::all_of(order.begin() + first, order.begin() + end,
+                    [&](auto index) {
+                        const auto& range = ranges[2 * index + 1];
+                        return device->owns_dma_range(range.data, range.bytes);
+                    });
+                if (scatter) {
+                    for (auto j = first; j < end; ++j) {
+                        wave.push_back(ranges[2 * order[j]]);
+                        wave.push_back(ranges[2 * order[j] + 1]);
+                    }
+                    chunks.push_back({{}, first, end});
+                    first = end;
+                    continue;
+                }
+                const auto bytes = (end - first) * record;
+                std::shared_ptr<SSDDmaBuffer> dma;
+                try {
+                    dma = device->allocate_dma_buffer(bytes);
+                } catch (const std::bad_alloc&) {
+                    // The device's bounded bounce slots can still service a coalesced range.
+                }
+                auto buffer = dma ? std::shared_ptr<void>(dma, dma->data())
+                                  : std::shared_ptr<void>(chunk_pool.allocate_io(bytes),
+                                        [this](void* p) { chunk_pool.release(p); });
+                if (write) {
+                    for (auto j = first; j < end; ++j) {
+                        auto* data = static_cast<char*>(buffer.get()) + (j - first) * record;
+                        const auto index = 2 * order[j];
+                        std::memcpy(data, ranges[index].prefix, record_header_bytes);
+                        std::memset(data + record_header_bytes, 0, payload_offset - record_header_bytes);
+                        std::memcpy(data + payload_offset, ranges[index + 1].data, payload);
+                    }
+                }
+                wave.push_back({buffer.get(), bytes, base});
+                chunks.push_back({std::move(buffer), first, end});
+                first = end;
+            }
+            if (write) device->write_many(wave);
+            else device->read_many(wave);
+            for (const auto& chunk : chunks) {
+                const auto base = ranges[2 * order[chunk.first]].offset;
+                for (auto j = chunk.first; j < chunk.end; ++j) {
+                    const auto i = order[j];
+                    const auto relative = (j - chunk.first) * record;
+                    if (write) {
+                        entries[i]->chunk_lba = base / sector;
+                        entries[i]->chunk_offset = relative;
+                    } else if (chunk.buffer) {
+                        const auto* data = static_cast<const char*>(chunk.buffer.get()) + relative;
+                        std::memcpy(ranges[2 * i].data, data, record_header_bytes);
+                        std::memcpy(ranges[2 * i + 1].data, data + payload_offset, payload);
+                    }
+                }
+            }
+        }
     }
     // 在同一遍读取中计算 CRC 并提取请求区间，避免先校验后另读引入内容差异。
     std::uint32_t payload_crc(const Allocation& allocation, std::size_t size, void* host = nullptr,
@@ -536,6 +641,7 @@ SSDStorageBackend::SSDStorageBackend(std::size_t bytes, std::size_t budget,
         state->metadata_padding.resize(alignment - record_header_bytes);
     }
     state->record = record;
+    state->sector = alignment;
     state->max_slots = slots;
     state->verification = verification;
     state->device = std::move(device);
@@ -555,12 +661,20 @@ std::shared_ptr<SSDDmaBuffer> SSDStorageBackend::allocate_dma_buffer(std::size_t
     return impl_->device ? impl_->device->allocate_dma_buffer(bytes)
                          : std::shared_ptr<SSDDmaBuffer>{};
 }
+std::shared_ptr<SSDDmaBuffer> SSDStorageBackend::allocate_transfer_buffer(std::size_t bytes) {
+    return impl_->device ? impl_->device->allocate_transfer_buffer(bytes)
+                         : std::shared_ptr<SSDDmaBuffer>{};
+}
+bool SSDStorageBackend::supports_chunk_io() const noexcept {
+    return !impl_->metadata_padding.empty() && impl_->record <= 1024 * 1024;
+}
 StorageHandle SSDStorageBackend::reserve() {
     IOTimer timer{impl_->reserve_ns};
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->allocations.create([&](std::size_t slot) {
         auto allocation = std::make_shared<Impl::Allocation>();
         allocation->slot = slot;
+        allocation->chunk_lba = slot * impl_->record / impl_->sector;
         return allocation;
     }, impl_->max_slots);
 }
@@ -716,7 +830,7 @@ void SSDStorageBackend::write_published_many(const std::vector<StorageWrite>& re
         }
         // Small records use one writev/SQE; large payloads precede their final header.
         if (impl_->device)
-            impl_->device->write_many(ranges);
+            impl_->device_batch(true, ranges, allocations, selected);
         else
             io->write_many(impl_->files[lane % impl_->file_count], ranges);
         for (auto i : selected) {
@@ -807,9 +921,8 @@ void SSDStorageBackend::read_validated_many(const std::vector<StorageRead>& requ
     std::vector<std::shared_ptr<Impl::Allocation>> allocations(requests.size());
     std::vector<std::unique_lock<std::mutex>> locks;
     std::vector<Header> headers(requests.size());
-    std::vector<FileIORequest> ranges;
+    std::vector<FileIORequest> ranges(2 * requests.size());
     locks.reserve(requests.size());
-    ranges.reserve(2 * requests.size());
     // 固定句柄顺序拿记录锁，避免两个并发批次反序访问时死锁。
     for (auto i : order) {
         allocations[i] = impl_->lookup(requests[i].handle);
@@ -819,10 +932,10 @@ void SSDStorageBackend::read_validated_many(const std::vector<StorageRead>& requ
         if (!allocation.sealed)
             throw std::logic_error("SSD batch record is not published");
         storage_detail::validate_io(impl_->payload, 0, requests[i].host, requests[i].expected.size);
-        ranges.push_back(
-            {headers[i].data(), headers[i].size(), std::uint64_t(impl_->offset(allocation))});
-        ranges.push_back({requests[i].host, requests[i].expected.size,
-                          std::uint64_t(impl_->offset(allocation)) + impl_->payload_offset});
+        ranges[2 * i] = {headers[i].data(), headers[i].size(),
+                         std::uint64_t(impl_->offset(allocation))};
+        ranges[2 * i + 1] = {requests[i].host, requests[i].expected.size,
+                             std::uint64_t(impl_->offset(allocation)) + impl_->payload_offset};
     }
     std::size_t parallel_bytes = 0;
     for (const auto& request : requests)
@@ -831,8 +944,9 @@ void SSDStorageBackend::read_validated_many(const std::vector<StorageRead>& requ
         impl_->parallel_read(*allocations[0], requests[0].expected, requests[0].host);
         return;
     }
-    if (impl_->io && requests.size() > 1 &&
-        (parallel_bytes >= 1024 * 1024 || impl_->file_count > 1)) {
+    const bool parallel = impl_->io && requests.size() > 1 &&
+                          (parallel_bytes >= 1024 * 1024 || impl_->file_count > 1);
+    if (parallel || impl_->device) {
         // FileIO 的原串行路径会拒绝重叠/溢出的目标；并发路径提交前同样核对，
         // 避免两个分片同时写一个 host 范围。
         for (std::size_t i = 0; i < ranges.size(); ++i) {
@@ -845,6 +959,8 @@ void SSDStorageBackend::read_validated_many(const std::vector<StorageRead>& requ
                     throw std::invalid_argument("Overlapping SSD batch destinations");
             }
         }
+    }
+    if (parallel) {
         impl_->prepare_parallel(false);
         const auto chunk = (requests.size() + 3) / 4;
         impl_->parallel[false].batch->run([&](std::size_t task) {
@@ -916,7 +1032,7 @@ void SSDStorageBackend::read_validated_many(const std::vector<StorageRead>& requ
                             0,requests[0].expected.size,impl_->parallel[false].lanes[lane].get());
         return;
     } else if (impl_->device)
-        impl_->device->read_many(ranges);
+        impl_->device_batch(false, ranges, allocations, std::move(order));
     else if (impl_->file_count > 1) {
         for (std::size_t i = 0; i < requests.size(); ++i)
             impl_->checked_read(*allocations[i], requests[i].expected, requests[i].host, 0,

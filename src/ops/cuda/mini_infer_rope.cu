@@ -8,7 +8,9 @@
 namespace mini_infer::detail {
 namespace {
 __global__ void rotate_pairs(float* q, float* k, std::size_t q_pairs,
-                             std::size_t k_pairs, int head_dim, int pos, float theta) {
+                             std::size_t k_pairs, int head_dim, int pos, float theta,
+                             const int32_t* device_position) {
+    if (device_position) pos = *device_position;
     // 一个线程负责一个偶奇对，同步旋转 Q 以及（若存在）对应的 K。
     for (std::size_t pair = blockIdx.x * blockDim.x + threadIdx.x;
          pair < q_pairs; pair += static_cast<std::size_t>(blockDim.x) * gridDim.x) {
@@ -27,11 +29,11 @@ __global__ void rotate_pairs(float* q, float* k, std::size_t q_pairs,
 }
 }
 void rope_cuda(Tensor& query, Tensor& key, int32_t head_dim,
-               int32_t position, float theta, cudaStream_t stream) {
+               int32_t position, float theta, cudaStream_t stream, const int32_t* device_position) {
     const auto pairs = query.size() / 2;
     const int blocks = static_cast<int>(std::min<std::size_t>((pairs + 255) / 256, 65535));
     rotate_pairs<<<blocks, 256, 0, stream>>>(query.ptr<float>(), key.ptr<float>(),
-                                            pairs, key.size() / 2, head_dim, position, theta);
+                                            pairs, key.size() / 2, head_dim, position, theta, device_position);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) {
         throw std::runtime_error(std::string("RoPE launch: ") + cudaGetErrorString(error));

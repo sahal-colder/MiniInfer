@@ -1,6 +1,7 @@
 #include "infer/cpu/cpu_block.h"
 
 #include <stdexcept>
+#include "infer/core/size_classes.h"
 
 namespace infer::cpu_detail {
 
@@ -9,11 +10,7 @@ std::size_t size_class(std::size_t bytes) {
         throw std::invalid_argument("Cannot allocate zero bytes.");
     if (bytes > std::numeric_limits<std::size_t>::max() - (alignment - 1))
         throw std::overflow_error("CPU pool allocation size overflow.");
-    if (bytes <= 1024)
-        return (bytes - 1) / alignment;
-    const unsigned exponent = 63U - __builtin_clzll(static_cast<unsigned long long>(bytes - 1));
-    const std::size_t base = std::size_t{1} << exponent;
-    return 16 + (exponent - 10) * 4 + (bytes - base - 1) / (base / 4);
+    return size_classes::bucket(bytes, 6).first;
 }
 
 std::size_t FreeBins::first_nonempty(std::size_t bin) const noexcept {

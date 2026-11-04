@@ -110,8 +110,8 @@ void GraphAllocator::finish_capture(GraphId id, bool abort) {
     capture_owner(capture_stream_);
     // 真正的 CUDA capture 必须先结束；钩子顺序错误时保留全部状态以供重试。
     not_cuda_capturing(capture_stream_);
-    if (graph_live_) {
-        throw std::runtime_error("Release graph host leases before end/abort");
+    if (graph_live_ && !abort) {
+        throw std::runtime_error("Release graph host leases before ending capture");
     }
     if (abort) {
         graphs_.erase(id);
@@ -122,6 +122,7 @@ void GraphAllocator::finish_capture(GraphId id, bool abort) {
         stats_.graph_peak_used_bytes = std::max(stats_.graph_peak_used_bytes, graph_offset_);
     }
     capture_ = nullptr;
+    graph_live_ = 0;
     graph_offset_ = 0;
     graph_allocations_.clear();
 }

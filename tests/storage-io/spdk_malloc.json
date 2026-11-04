@@ -1,0 +1,26 @@
+{
+  "subsystems": [
+    {
+      "subsystem": "iobuf",
+      "config": [
+        {
+          "method": "iobuf_set_options",
+          "params": { "small_pool_count": 512, "large_pool_count": 64 }
+        }
+      ]
+    },
+    {
+      "subsystem": "bdev",
+      "config": [
+        {
+          "method": "bdev_set_options",
+          "params": { "bdev_io_pool_size": 1024, "bdev_io_cache_size": 64 }
+        },
+        {
+          "method": "bdev_malloc_create",
+          "params": { "name": "Malloc0", "num_blocks": 8192, "block_size": 4096 }
+        }
+      ]
+    }
+  ]
+}

@@ -8,10 +8,13 @@ void paged_attention_f32(const float*,const float* const*,float*,std::size_t,std
 }
 
 namespace infer {
-void paged_attention_qk_f32(const float*,const float* const*,float*,std::size_t,std::size_t,int,int,int,int,cudaStream_t) {
+void paged_attention_qk_f32(const float*,const float* const*,float*,std::size_t,std::size_t,int,int,int,int,cudaStream_t,const int32_t*) {
     throw std::runtime_error("Paged attention requires CUDA kernels");
 }
-void paged_attention_av_f32(const float*,const float* const*,float*,std::size_t,std::size_t,int,int,int,int,cudaStream_t) {
+void paged_attention_av_f32(const float*,const float* const*,float*,std::size_t,std::size_t,int,int,int,int,cudaStream_t,const int32_t*) {
     throw std::runtime_error("Paged attention requires CUDA kernels");
+}
+void paged_kv_store_f32(const float*,const float*,const float* const*,std::size_t,int,const int32_t*,cudaStream_t) {
+    throw std::runtime_error("Paged KV store requires CUDA kernels");
 }
 }

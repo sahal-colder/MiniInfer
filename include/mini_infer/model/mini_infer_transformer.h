@@ -1,5 +1,6 @@
 #pragma once
 
+#include "infer/storage/async_kv_pipeline.h"
 #include "mini_infer/ops/mini_infer_add.h"
 #include "mini_infer/ops/mini_infer_attention.h"
 #include "mini_infer/model/mini_infer_model_weights.h"
@@ -16,9 +17,10 @@ struct TransformerWorkspace {
     Tensor projected;    // [dim]：Wo 投影结果
     Tensor residual;     // [dim]：attention 残差结果
     MLPWorkspace mlp;
+    Tensor key, value; // Batched prefill projections, before paged KV scatter.
 
     TransformerWorkspace(const ModelConfig& config,
-                         std::shared_ptr<DeviceAllocator> allocator);
+                         std::shared_ptr<DeviceAllocator> allocator, int32_t rows = 1);
 };
 
 // 一个完整的 pre-norm decoder block：
@@ -38,8 +40,15 @@ public:
                  cudaStream_t stream = nullptr);
     void forward_paged(const Tensor& input,Tensor& output,Tensor& key,Tensor& value,
         const float* const* pages,std::size_t tokens_per_page,int32_t position,
-        TransformerWorkspace&,cudaStream_t);
+        TransformerWorkspace&,cudaStream_t,const int32_t* device_position = nullptr);
+    void forward_paged(const Tensor& input, Tensor& output, infer::AsyncKVPipeline::LayerView kv,
+                       int32_t position, TransformerWorkspace& work, cudaStream_t stream);
+    void prefill(const Tensor& input, Tensor& output, int32_t position,
+                 TransformerWorkspace& work, cudaStream_t stream,
+                 const float* const* pages, std::size_t tokens_per_page,
+                 KVCache* cache = nullptr, int32_t layer = 0);
 private:
+    int32_t heads_, kv_heads_;
     int32_t head_dim_;               // 每个 Attention 头对应的特征维度（dim / head_num）
     RMSNormLayer norm_;              // Attention 前的归一化算子
     AttentionQKV qkv_;               // Wq, Wk, Wv 线性变换与 RoPE

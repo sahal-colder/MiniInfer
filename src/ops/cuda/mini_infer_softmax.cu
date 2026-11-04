@@ -20,7 +20,8 @@ using Maximum = cub::Max;
 // 一个 block 处理一行。每个线程先做局部 max/sum，再用 CUB 合并。
 // width 可以大于 blockDim.x；尾部线程仍参与归约和全部同步。
 __global__ void softmax_f32(const float* input, float* output, std::size_t rows,
-                            int32_t width, int32_t stride) {
+                            int32_t width, int32_t stride, const int32_t* device_position) {
+    if (device_position) width = *device_position + 1;
     using Reduce = cub::BlockReduce<float, threads>;
     __shared__ typename Reduce::TempStorage storage;
     __shared__ float row_max;
@@ -53,9 +54,9 @@ __global__ void softmax_f32(const float* input, float* output, std::size_t rows,
 
 namespace detail {
 void softmax_rows_cuda(const float* input, float* output, std::size_t rows,
-                       int32_t width, int32_t stride, cudaStream_t stream) {
+                       int32_t width, int32_t stride, cudaStream_t stream, const int32_t* device_position) {
     const unsigned int blocks = static_cast<unsigned int>(std::min<std::size_t>(rows, 65535));
-    softmax_f32<<<blocks, threads, 0, stream>>>(input, output, rows, width, stride);
+    softmax_f32<<<blocks, threads, 0, stream>>>(input, output, rows, width, stride, device_position);
     check_cuda(cudaGetLastError(), "Softmax kernel launch");
 }
 }  // namespace detail

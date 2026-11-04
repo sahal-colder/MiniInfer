@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <unordered_map>
 #include <utility>
+#include "infer/core/size_classes.h"
 
 namespace infer {
 struct CachingCUDAAllocatorConfig;
@@ -14,7 +15,7 @@ struct CUDAMemoryPoolStats;
 namespace cuda_pool_detail {
 struct Stream; // 非拥有关系；本头文件不依赖 CUDA，也不操作 stream/event。
 struct Block;
-inline constexpr unsigned bin_count = sizeof(std::size_t) * 8 * 4;
+inline constexpr unsigned bin_count = size_classes::count;
 using BinBitmap = std::array<std::uint64_t, (bin_count + 63) / 64>;
 // 桶头与位图一起传递，split/merge/stream 迁移时不会遗漏位图更新。
 struct Bins {

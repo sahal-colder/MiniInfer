@@ -8,6 +8,9 @@ CachingPinnedHostAllocator::~CachingPinnedHostAllocator() = default;
 void* CachingPinnedHostAllocator::allocate(std::size_t size, cudaStream_t stream) const {
     return pool_.allocate(size, stream);
 }
+void* CachingPinnedHostAllocator::allocate_io(std::size_t size) const {
+    return pool_.allocate_io(size);
+}
 void CachingPinnedHostAllocator::release(void* ptr, cudaStream_t stream) const {
     pool_.release(ptr, stream);
 }

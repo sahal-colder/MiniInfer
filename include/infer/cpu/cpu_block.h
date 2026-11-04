@@ -14,46 +14,21 @@ constexpr std::size_t alignment = 64;
 constexpr unsigned size_bits = std::numeric_limits<std::size_t>::digits;
 static_assert(size_bits >= 32 && size_bits <= 64);
 
-// 总分桶（Size Class）数量：
-// - 前 16 个桶：线性增长（64B ~ 1024B，步长 64B）
-// - 后续桶：从 2^10 (1KiB) 到 2^(size_bits-1)，每个 2 的幂次区间细分为 4 个子桶（步长为 1/4
-// 区间大小）
-constexpr std::size_t bin_count = 16 + 4 * (size_bits - 10);
-
-// 小内存块的桶数量上限：64B..1KiB 共 16 桶，1KiB..4KiB 共 8 桶（合计 24 桶）
-constexpr std::size_t small_bin_count = 24; // 64B..1KiB 16 桶，1..4KiB 8 桶。
-
-// 小内存块的字节阈值（4KiB，即一个标准内存页大小），通常用于区分 TLS 缓存策略与中央池分配策略
+// 64-byte linear classes through 4 KiB, then 64 classes per octave.
+constexpr std::size_t bin_count = 64 + 64 * (size_bits - 12);
+constexpr std::size_t small_bin_count = 64;
 constexpr std::size_t small_limit = 4096;
-
-// 位图（Bitmap）所需的 64 位字（uint64_t）数量，用于快速标记和查找非空桶（向上取整）
 constexpr std::size_t word_count = (bin_count + 63) / 64;
-
-/**
- * @brief 编译期生成所有桶（Bin）对应的最大容量表
- *
- * 分桶策略（结合线性与对数间距，控制内部碎片率在 25% 以内）：
- * 1. [0, 15] 号桶：64B, 128B, 192B, ..., 1024B（线性步长 64B）
- * 2. [16, bin_count-1] 号桶：按 2^exponent 指数增长（从 1024B 开始），
- *    每个指数区间均分为 4 份（即 1.25x, 1.5x, 1.75x, 2.0x * 2^exponent）
- */
 constexpr auto make_capacities() {
     std::array<std::size_t, bin_count> result{};
     std::size_t index = 0;
-
-    // 1. 生成前 16 个小容量桶：64B ~ 1024B
-    for (std::size_t n = 1; n <= 16; ++n)
-        result[index++] = n * alignment;
-
-    // 2. 生成大于 1KiB 的对数细分桶
-    for (unsigned exponent = 10; exponent < size_bits; ++exponent) {
+    for (std::size_t n = 1; n <= 64; ++n) result[index++] = n * alignment;
+    for (unsigned exponent = 12; exponent < size_bits; ++exponent) {
         const std::size_t base = std::size_t{1} << exponent;
-        for (unsigned part = 1; part <= 4; ++part) {
-            // 最后一个桶特殊处理：防止 size_t 算术溢出，同时向下对齐到 alignment 的整数倍
-            result[index++] = exponent == size_bits - 1 && part == 4
-                                  ? std::numeric_limits<std::size_t>::max() - (alignment - 1)
-                                  : base + (base / 4) * part;
-        }
+        for (unsigned part = 1; part <= 64; ++part)
+            result[index++] = exponent == size_bits - 1 && part == 64
+                ? std::numeric_limits<std::size_t>::max() - (alignment - 1)
+                : base + (base / 64) * part;
     }
     return result;
 }

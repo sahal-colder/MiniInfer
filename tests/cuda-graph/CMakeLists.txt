@@ -1,0 +1,10 @@
+find_package(GTest REQUIRED)
+include(GoogleTest)
+
+add_executable(cuda_graph_test cuda_graph_pool_test.cu)
+target_link_libraries(cuda_graph_test PRIVATE infer_memory GTest::gtest_main)
+if(INFER_BUILD_NATIVE)
+    target_sources(cuda_graph_test PRIVATE cuda_graph_model_test.cpp)
+    target_link_libraries(cuda_graph_test PRIVATE mini_infer_compute)
+endif()
+gtest_discover_tests(cuda_graph_test PROPERTIES TIMEOUT 60 LABELS cuda-graph)

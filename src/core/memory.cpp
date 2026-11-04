@@ -4,7 +4,9 @@
 #include "infer/cuda/cuda_memory_pool.h"
 #endif
 
+#include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -13,6 +15,14 @@
 #include <utility>
 
 namespace infer {
+
+std::size_t io_allocation_size(std::size_t bytes) {
+    if (!bytes)
+        throw std::invalid_argument("Cannot allocate zero bytes.");
+    if (bytes > std::numeric_limits<std::size_t>::max() - (io_alignment - 1))
+        throw std::bad_alloc();
+    return (bytes + io_alignment - 1) & ~(io_alignment - 1);
+}
 
 DeviceAllocator::DeviceAllocator(DeviceType device_type) : device_type_(device_type) {}
 
@@ -94,11 +104,15 @@ void* CPUDeviceAllocator::allocate(std::size_t size, cudaStream_t /*stream*/) co
     }
 
     void* ptr = nullptr;
-    int ret = posix_memalign(&ptr, 64, size);
+    int ret = posix_memalign(&ptr, size >= io_alignment ? io_alignment : 64, size);
     if (ret != 0) {
         throw std::bad_alloc();
     }
     return ptr;
+}
+
+void* CPUDeviceAllocator::allocate_io(std::size_t size) const {
+    return allocate(io_allocation_size(size));
 }
 
 void CPUDeviceAllocator::release(void* ptr, cudaStream_t /*stream*/) const {
@@ -113,23 +127,39 @@ PinnedHostAllocator::PinnedHostAllocator() : DeviceAllocator(DeviceType::CPU) {
 #endif
 }
 
-void* PinnedHostAllocator::allocate(std::size_t size, cudaStream_t /*stream*/) const {
-    if (size == 0) {
+namespace {
+void* allocate_pinned(std::size_t size, std::size_t alignment) {
+    if (!size)
         throw std::invalid_argument("Cannot allocate zero bytes.");
-    }
 
 #if INFER_ENABLE_CUDA
-    void* ptr = nullptr;
-    cudaError_t err = cudaMallocHost(&ptr, size);
-    if (err == cudaErrorMemoryAllocation) {
+    const auto overhead = sizeof(void*) + alignment - 1;
+    if (size > std::numeric_limits<std::size_t>::max() - overhead)
         throw std::bad_alloc();
-    }
+    void* base = nullptr;
+    const auto err = cudaMallocHost(&base, size + overhead);
+    if (err == cudaErrorMemoryAllocation)
+        throw std::bad_alloc();
     check_cuda(err, "Failed to allocate pinned host memory via cudaMallocHost");
-    return ptr;
+    const auto address = reinterpret_cast<std::uintptr_t>(base) + overhead;
+    auto* data = reinterpret_cast<void*>(address & ~(alignment - 1));
+    // CUDA frees the original allocation, including any leading padding.
+    std::memcpy(static_cast<char*>(data) - sizeof(base), &base, sizeof(base));
+    return data;
 #else
+    (void)alignment;
     throw std::system_error(std::make_error_code(std::errc::operation_not_supported),
                             "Pinned memory requires CUDA support");
 #endif
+}
+} // namespace
+
+void* PinnedHostAllocator::allocate(std::size_t size, cudaStream_t /*stream*/) const {
+    return allocate_pinned(size, size >= io_alignment ? io_alignment : 64);
+}
+
+void* PinnedHostAllocator::allocate_io(std::size_t size) const {
+    return allocate_pinned(io_allocation_size(size), io_alignment);
 }
 
 void PinnedHostAllocator::release(void* ptr, cudaStream_t /*stream*/) const {
@@ -137,7 +167,9 @@ void PinnedHostAllocator::release(void* ptr, cudaStream_t /*stream*/) const {
         return;
 #if INFER_ENABLE_CUDA
     // 与 cudaMallocHost 成对；调用者须已完成所有异步使用。
-    check_cuda(cudaFreeHost(ptr), "Failed to free pinned host memory via cudaFreeHost");
+    void* base;
+    std::memcpy(&base, static_cast<char*>(ptr) - sizeof(base), sizeof(base));
+    check_cuda(cudaFreeHost(base), "Failed to free pinned host memory via cudaFreeHost");
 #else
     throw std::system_error(std::make_error_code(std::errc::operation_not_supported),
                             "Pinned memory requires CUDA support");

@@ -16,8 +16,9 @@ struct SSDDeviceStats {
     std::uint64_t direct_read_bytes = 0, direct_written_bytes = 0;
 };
 
-// A device-owned DMA allocation. Its owner keeps the SPDK environment alive;
-// CUDA registrations must be removed before releasing the final reference.
+// A device-owned DMA allocation. Its owner keeps the SPDK environment alive.
+// Transfer buffers also own their CUDA registration. Finish all DMA before
+// dropping the final reference; externally added registrations remain caller-owned.
 class SSDDmaBuffer {
   public:
     virtual ~SSDDmaBuffer() = default;
@@ -48,6 +49,9 @@ class SSDDevice {
     // Filesystem devices return empty. SPDK page-rounds and charges live leases
     // plus its fixed bounce slots to dma_budget_bytes; exhaustion throws.
     virtual std::shared_ptr<SSDDmaBuffer> allocate_dma_buffer(std::size_t) { return {}; }
+    virtual bool owns_dma_range(const void*, std::size_t) const { return false; }
+    // Owns CUDA registration as well as DMA memory. Empty when unsupported.
+    virtual std::shared_ptr<SSDDmaBuffer> allocate_transfer_buffer(std::size_t) { return {}; }
 };
 
 struct SpdkBdevConfig {

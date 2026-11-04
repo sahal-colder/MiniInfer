@@ -185,6 +185,8 @@ class SSDStorageBackend final : public StorageBackend {
     std::size_t payload_offset() const noexcept;
     // Empty for files; owning devices charge DMA leases to their own budget.
     std::shared_ptr<SSDDmaBuffer> allocate_dma_buffer(std::size_t bytes);
+    std::shared_ptr<SSDDmaBuffer> allocate_transfer_buffer(std::size_t bytes);
+    bool supports_chunk_io() const noexcept;
     StorageHandle reserve() override;
     void release(StorageHandle handle) override;
     StorageMemoryView memory_view(StorageHandle handle) const override; // data 始终为空。

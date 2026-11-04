@@ -174,7 +174,7 @@ TieredStorage::TieredStorage(StorageConfig config, std::unique_ptr<StorageBacken
             if (config.ssd_direct)
                 ssd = std::make_unique<SSDStorageBackend>(config.block_bytes, config.budget.ssd_bytes,
                     io::open_direct_file_device(config.ssd_directory,
-                        config.budget.ssd_bytes / 4096 * 4096, config.ssd_io.queue_depth),
+                        config.budget.ssd_bytes / io_alignment * io_alignment, config.ssd_io.queue_depth),
                     config.ssd_verification);
             else if (config.ssd_spdk.bdev_name.empty())
                 ssd = std::make_unique<SSDStorageBackend>(

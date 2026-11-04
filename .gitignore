@@ -12,8 +12,12 @@ __pycache__/
 benchmark-results/
 
 # Product-source publication; development material stays local.
-/tests/
-/benchmarks/
+/tests/*
+!/tests/async-kv/
+!/tests/cuda-graph/
+!/tests/storage-io/
+/benchmarks/build/
+/benchmarks/results/
 /examples/
 /docs/
 /tools/

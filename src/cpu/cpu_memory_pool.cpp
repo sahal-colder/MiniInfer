@@ -61,11 +61,13 @@ class CachingCPUDeviceAllocator::Impl : public std::enable_shared_from_this<Impl
 
   public:
     Impl(std::shared_ptr<DeviceAllocator> upstream, CachingCPUAllocatorConfig config)
-        : config_(config), upstream_(std::move(upstream)) {
+        : config_(config), upstream_(std::move(upstream)),
+          cpu_(dynamic_cast<CPUDeviceAllocator*>(upstream_.get())),
+          pinned_(dynamic_cast<PinnedHostAllocator*>(upstream_.get())) {
         if (!upstream_ || upstream_->device_type() != DeviceType::CPU)
             throw std::invalid_argument("CPU pool needs a CPU upstream allocator.");
         if (config_.mapped_block_bytes &&
-            (config_.enable_thread_cache || !dynamic_cast<CPUDeviceAllocator*>(upstream_.get()) ||
+            (config_.enable_thread_cache || !cpu_ ||
              config_.mapped_block_bytes < 256 * 1024 || config_.mapped_block_bytes % 4096 ||
              config_.mapped_block_bytes != capacities[size_class(config_.mapped_block_bytes)]))
             throw std::invalid_argument("Mapped batches require a central pageable size class");
@@ -88,13 +90,13 @@ class CachingCPUDeviceAllocator::Impl : public std::enable_shared_from_this<Impl
         }
     }
 
-    void* allocate(std::size_t bytes) {
+    void* allocate(std::size_t bytes, bool aligned_io = false) {
         const auto bin = size_class(bytes);
         ThreadCache* cache = bin < small_bin_count ? find_cache() : nullptr;
         {
             LocalAccess access(cache);
             if (access) {
-                const auto available = suitable(cache->free, bin);
+                const auto available = suitable(cache->free, bin, aligned_io);
                 if (available != bin_count) {
                     Block* block = cache->free.pop(available);
                     activate(block);
@@ -111,14 +113,14 @@ class CachingCPUDeviceAllocator::Impl : public std::enable_shared_from_this<Impl
         {
             FrozenCache frozen(cache);
             // 本地尝试失败可能只是 stats/trim 暂时冻结；拿锁后再查一次。
-            const auto local = cache ? suitable(cache->free, bin) : bin_count;
+            const auto local = cache ? suitable(cache->free, bin, aligned_io) : bin_count;
             if (local != bin_count) {
                 Block* block = cache->free.pop(local);
                 activate(block);
                 ++stats_.reuse_count;
                 return block->ptr;
             }
-            const auto available = suitable(free_, bin);
+            const auto available = suitable(free_, bin, aligned_io);
             if (available != bin_count) {
                 Block* block = free_.pop(available);
                 if (can_attach(cache, block)) {
@@ -195,6 +197,12 @@ class CachingCPUDeviceAllocator::Impl : public std::enable_shared_from_this<Impl
         if (can_attach(cache, block))
             move_to_thread(block, cache);
         return ptr;
+    }
+
+    void* allocate_io(std::size_t bytes) {
+        if (!cpu_ && !pinned_)
+            throw std::logic_error("Aligned I/O allocation requires a built-in CPU upstream");
+        return allocate(io_allocation_size(bytes), true);
     }
 
     void release(void* ptr) {
@@ -321,12 +329,14 @@ class CachingCPUDeviceAllocator::Impl : public std::enable_shared_from_this<Impl
         if (!block->active)
             throw std::invalid_argument("CPU pool: block already released.");
     }
-    std::size_t suitable(const FreeBins& bins, std::size_t bin) const noexcept {
-        const auto available = bins.first_nonempty(bin);
+    std::size_t suitable(const FreeBins& bins, std::size_t bin, bool aligned_io) const noexcept {
+        auto available = bins.first_nonempty(bin);
+        while (aligned_io && available != bin_count && capacities[available] % io_alignment)
+            available = bins.first_nonempty(available + 1);
         if (available == bin_count)
             return bin_count;
         const auto waste = capacities[available] - capacities[bin];
-        return waste <= config_.max_reuse_waste && waste <= capacities[bin] / 2 ? available
+        return waste <= config_.max_reuse_waste && waste <= capacities[bin] / 256 ? available
                                                                                 : bin_count;
     }
     Usage& usage(Block* block) noexcept { return block->owner ? block->owner->usage : usage_; }
@@ -462,6 +472,8 @@ class CachingCPUDeviceAllocator::Impl : public std::enable_shared_from_this<Impl
     }
     const CachingCPUAllocatorConfig config_;
     const std::shared_ptr<DeviceAllocator> upstream_;
+    CPUDeviceAllocator* const cpu_;
+    PinnedHostAllocator* const pinned_;
     mutable std::mutex mutex_;
     std::unordered_map<void*, Block> blocks_;
     FreeBins free_;
@@ -485,6 +497,9 @@ CachingCPUDeviceAllocator::CachingCPUDeviceAllocator(std::shared_ptr<DeviceAlloc
 CachingCPUDeviceAllocator::~CachingCPUDeviceAllocator() = default;
 void* CachingCPUDeviceAllocator::allocate(std::size_t size, cudaStream_t /*stream*/) const {
     return impl_->allocate(size);
+}
+void* CachingCPUDeviceAllocator::allocate_io(std::size_t size) const {
+    return impl_->allocate_io(size);
 }
 void CachingCPUDeviceAllocator::release(void* ptr, cudaStream_t /*stream*/) const {
     impl_->release(ptr);

@@ -82,6 +82,7 @@ void output(std::ostream& out,const Request& r,std::size_t prompt_count) {
 }
 int main(int argc,char** argv) {try {
     std::string path,variant="paged-tiered";std::size_t prompt_count=48,generated=12,page_tokens=8,gpu=1<<20,host=512<<10;
+    bool gpu_override=false;
     for(int i=1;i<argc;i+=2) {
         if(i+1==argc)throw std::invalid_argument("Missing benchmark argument value");
         const std::string key=argv[i],value=argv[i+1];
@@ -90,12 +91,12 @@ int main(int argc,char** argv) {try {
         else if(key=="--prompt")prompt_count=number(value);
         else if(key=="--generate")generated=number(value);
         else if(key=="--page-tokens")page_tokens=number(value);
-        else if(key=="--gpu-bytes")gpu=number(value);
+        else if(key=="--gpu-bytes") {gpu=number(value);gpu_override=true;}
         else if(key=="--host-bytes")host=number(value);
         else throw std::invalid_argument("Unknown benchmark argument: "+key);
     }
     if(path.empty())throw std::invalid_argument("--model is required");
-    if(variant!="legacy"&&variant!="paged-resident"&&variant!="paged-tiered"&&variant!="paged-demand")throw std::invalid_argument("Unknown variant");
+    if(variant!="legacy"&&variant!="paged-resident"&&variant!="paged-tiered"&&variant!="paged-demand"&&variant!="paged-async")throw std::invalid_argument("Unknown variant");
     const auto context=Clock::now();
     mini_infer::check_cuda(cudaSetDevice(0),"Benchmark device");
     mini_infer::check_cuda(cudaFree(nullptr),"Benchmark context initialization");
@@ -104,7 +105,11 @@ int main(int argc,char** argv) {try {
     options.kv_mode=variant=="legacy"?mini_infer::ModelKVMode::CONTIGUOUS:mini_infer::ModelKVMode::PAGED;
     options.paged.tokens_per_page=page_tokens;
     if(variant=="paged-resident")options.paged.resident_layers=0;
-    else {options.paged.gpu_bytes=gpu;options.paged.host_bytes=host;}
+    else {
+        options.paged.enable_async_kv_pipeline=variant=="paged-async";
+        options.paged.gpu_bytes=options.paged.enable_async_kv_pipeline && !gpu_override ? 0 : gpu;
+        options.paged.host_bytes=host;
+    }
     options.paged.prefetch=variant!="paged-demand";
     rusage before{},after{};getrusage(RUSAGE_SELF,&before);
     const auto initialized=Clock::now();mini_infer::LlamaModel model(path,allocator,options);

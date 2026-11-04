@@ -10,5 +10,7 @@ int if_dlsym_open_fd(int fd, uint64_t size, int own, if_dev **out);
 #endif
 #ifdef IF_HAVE_URING
 int if_uring_open_fd(int fd, uint64_t size, int own, if_dev **out);
+int if_uring_open_configured(int fd, uint64_t size, int own, unsigned depth,
+                             const struct iovec *buffers, unsigned count, if_dev **out);
 #endif
 #endif

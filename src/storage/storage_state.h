@@ -155,6 +155,9 @@ std::vector<LogicalBlockRecord*> prepare_batch(StorageState& state, const std::v
 void cancel_prepared(StorageState& state, LogicalBlockRecord& record) noexcept;
 MigrationResult execute_transfer(StorageState& state, LogicalBlockRecord& record,
                                  bool* quarantined = nullptr);
+std::size_t execute_chunk_batch(StorageState& state, const std::vector<LogicalBlockRecord*>& records,
+                                std::vector<MigrationResult>& results, std::size_t first,
+                                bool& quarantined);
 class MigrationExecutor {
   public:
     MigrationExecutor(std::shared_ptr<StorageState> state, std::size_t capacity);

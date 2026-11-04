@@ -16,6 +16,7 @@ void rope_inplace(Tensor& query, Tensor& key, int32_t head_dim,
 namespace detail {
 // 参数由上面的公开接口统一检查；CUDA 内核异步提交到同一 stream。
 void rope_cuda(Tensor& query, Tensor& key, int32_t head_dim,
-               int32_t position, float theta, cudaStream_t stream);
+               int32_t position, float theta, cudaStream_t stream,
+               const int32_t* device_position = nullptr);
 }
 }  // namespace mini_infer

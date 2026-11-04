@@ -1,6 +1,9 @@
 #include "mini_infer/model/mini_infer_paged_cache.h"
 #include "mini_infer/base/checked_math.h"
+#include "infer/cuda/cuda_block.h"
+#include "infer/cuda/cuda_memory_pool.h"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <deque>
@@ -32,6 +35,9 @@ struct PagedModelCache::Impl {
     struct Pending { std::size_t layer;std::deque<infer::PagedKV::Ticket> jobs; };
     std::optional<Pending> pending;
     PagedModelStats counts;
+    std::atomic<std::uint64_t> host_read_bytes{0},host_written_bytes{0};
+    bool reset_started=false;
+    std::unique_ptr<infer::AsyncKVPipeline> pipeline;
     Impl(const ModelConfig& c,PagedModelConfig value,std::shared_ptr<DeviceAllocator> allocator)
         : model(c),options(std::move(value)),used(c.layer_num,0) {
         if(!allocator || allocator->device_type()!=DeviceType::CUDA || c.dim<=0 || c.seq_len<=0 ||
@@ -61,9 +67,26 @@ struct PagedModelCache::Impl {
         config.budget.gpu_bytes=options.gpu_bytes ? options.gpu_bytes : multiply(options.resident_layers ? std::min<std::size_t>(c.layer_num,options.resident_layers) : std::size_t(c.layer_num),layer);
         config.budget.cpu_bytes=options.host_bytes ? options.host_bytes : multiply(add(c.layer_num,2*max_pages),options.page_bytes);
         config.budget.ssd_bytes=options.ssd_bytes ? options.ssd_bytes : multiply(multiply(c.layer_num,max_pages+1),options.page_bytes+4096);
-        if(config.budget.gpu_bytes<options.page_bytes || config.budget.cpu_bytes<multiply(c.layer_num,options.page_bytes))
+        if (config.budget.cpu_bytes < multiply(c.layer_num, options.page_bytes) ||
+            (!options.enable_async_kv_pipeline && config.budget.gpu_bytes < options.page_bytes))
             throw std::invalid_argument("KV GPU budget needs one page; host budget needs one all-layer page group");
+        if (options.enable_async_kv_pipeline) config.budget.gpu_bytes = 0;
         cache=std::make_unique<infer::PagedKV>(config,c.layer_num,tokens,"llama-model-instance/f32/rope10000/causal");
+        if (options.enable_async_kv_pipeline) {
+            pipeline = std::make_unique<infer::AsyncKVPipeline>(
+                infer::AsyncKVPipeline::Config{std::size_t(c.layer_num), max_pages, options.page_bytes,
+                                               tokens, kv_dim * sizeof(float), config.gpu_device,
+                                               options.gpu_bytes,
+                                               options.resident_layers==0 && (!options.gpu_bytes ||
+                                                   options.gpu_bytes >= multiply(c.layer_num,
+                                                       infer::cuda_pool_detail::allocation_bucket(
+                                                           add(layer,multiply(max_pages,sizeof(void*))),{}).second))},
+                [this](const infer::LayerRead& job) { read_layer(job); },
+                [this](std::size_t layer, std::size_t position, const std::byte* key, const std::byte* value) {
+                    write_rows(layer, position, key, value);
+                });
+            return;
+        }
         try {
             check_cuda(cudaStreamCreateWithFlags(&compute,cudaStreamNonBlocking),"Paged compute stream");
             check_cuda(cudaHostAlloc(&host_table,multiply(max_pages,sizeof(void*)),cudaHostAllocPortable),"Paged pinned table");
@@ -71,6 +94,49 @@ struct PagedModelCache::Impl {
             if(table_bytes>std::size_t(INT32_MAX)) throw std::length_error("KV page table exceeds Tensor dimensions");
             device_table=Tensor(DataType::INT8,{static_cast<int32_t>(table_bytes)},allocator);
         } catch(...) { cleanup();throw; }
+    }
+    // Sequence ownership stays on the scheduler until all I/O callbacks retire.
+    void read_layer(const infer::LayerRead& job) {
+        constexpr std::size_t batch_size = 64;
+        std::vector<infer::BlockId> ids;
+        std::vector<void*> destinations;
+        ids.reserve(std::min(job.pages, batch_size));
+        destinations.reserve(ids.capacity());
+        for (std::size_t first = 0; first < job.pages; first += batch_size) {
+            const auto end = std::min(first + batch_size, job.pages);
+            ids.clear();
+            destinations.clear();
+            for (auto page = first; page < end; ++page) {
+                const auto meta=cache->metadata(sequence,page,job.layer);
+                if (meta.location==Location::CPU) host_read_bytes.fetch_add(options.page_bytes,std::memory_order_relaxed);
+                ids.push_back(meta.id);
+                destinations.push_back(job.destination + page * options.page_bytes);
+            }
+            cache->storage().read_to_host_many(ids, destinations, options.page_bytes);
+        }
+    }
+    void write_rows(std::size_t layer, std::size_t position, const std::byte* key, const std::byte* value) {
+        // A batched prefill can dirty multiple pages, including pages spilled
+        // during admission. Restore each destination within the host budget.
+        const auto page=position/tokens;
+        if (cache->metadata(sequence,page,layer).location==Location::SSD) {
+            for (std::size_t victim=0;victim<used.size();++victim) {
+                for (const auto index:select(victim,Location::CPU)) {
+                    if (cache->storage().stats(Location::CPU).reserved_bytes<=config.budget.cpu_bytes-options.page_bytes) break;
+                    if (victim==layer && index==page) continue;
+                    auto job=cache->prefetch_pages(sequence,victim,Location::SSD,{index});job.wait();
+                    ++counts.ssd_spilled_pages;
+                }
+            }
+            auto job=cache->prefetch_pages(sequence,layer,Location::CPU,{page});job.wait();
+        }
+        auto lease = cache->acquire(sequence, page, layer, infer::AccessMode::WRITE);
+        const auto row_bytes = kv_dim * sizeof(float);
+        auto* row = static_cast<std::byte*>(lease.writable_data()) + position % tokens * row_bytes;
+        std::memcpy(row, key, row_bytes);
+        std::memcpy(row + tokens * row_bytes, value, row_bytes);
+        host_written_bytes.fetch_add(2*row_bytes,std::memory_order_relaxed);
+        lease.finish();
     }
     void drain() {
         if(!pending) return;
@@ -90,7 +156,10 @@ struct PagedModelCache::Impl {
         if(host_table) {cudaFreeHost(host_table);host_table=nullptr;}
         if(compute) {cudaStreamDestroy(compute);compute=nullptr;}
     }
-    ~Impl() { cleanup(); }
+    ~Impl() {
+        pipeline.reset(); // Its worker borrows sequence and storage.
+        cleanup();
+    }
     std::vector<std::size_t> select(std::size_t layer,Location source) const {
         std::vector<std::size_t> result;
         for(std::size_t p=0;p<sequence.page_count();++p) {
@@ -111,6 +180,7 @@ struct PagedModelCache::Impl {
             const std::vector<std::size_t> group(indices.begin()+first,indices.begin()+std::min(indices.size(),first+64));
             auto ticket=cache->prefetch_pages(sequence,layer,target,group);ticket.wait();
             if(source==Location::GPU) counts.gpu_evicted_pages+=group.size();
+            if(target==Location::CPU) host_written_bytes+=group.size()*options.page_bytes;
             if(target==Location::SSD) counts.ssd_spilled_pages+=group.size();
         }
     }
@@ -161,6 +231,8 @@ struct PagedModelCache::Impl {
     }
     void submit_layer(std::size_t layer,bool ahead) {
         auto indices=missing(layer);
+        for (const auto page:indices)
+            if (cache->metadata(sequence,page,layer).location==Location::CPU) host_read_bytes+=options.page_bytes;
         if(ahead) counts.prefetched_pages+=indices.size();else counts.demand_fault_pages+=indices.size();
         pending.emplace(Pending{layer,{}});
         try {
@@ -191,7 +263,12 @@ std::size_t PagedModelCache::begin_request(const int32_t* input,std::size_t coun
     return s.sequence.matched_tokens;
 }
 void PagedModelCache::begin_token(int32_t token,int32_t position) {
+    begin_batch(&token,1,position);
+}
+void PagedModelCache::begin_batch(const int32_t* input,std::size_t count,int32_t first) {
     auto& s=*impl_;
+    for (std::size_t i=0;i<count;++i) {
+        const auto position=first+static_cast<int32_t>(i);
     if(position<0 || std::size_t(position)!=s.history.size()) throw std::logic_error("Non-contiguous paged token admission");
     if(std::size_t(position)%s.tokens==0) {
         s.drain();
@@ -204,9 +281,11 @@ void PagedModelCache::begin_token(int32_t token,int32_t position) {
             std::memset(lease.writable_data(),0,lease.bytes());lease.finish();
         }
     }
-    s.history.push_back(token);++s.counts.computed_tokens;
+    s.history.push_back(input[i]);++s.counts.computed_tokens;
+    }
+    if (s.pipeline) s.pipeline->begin_token(first,count);
 }
-PagedModelCache::Layer PagedModelCache::prepare_layer(std::size_t layer,int32_t position) {
+PagedModelCache::Layer PagedModelCache::prepare_layer(std::size_t layer,int32_t position,int32_t first_position) {
     auto& s=*impl_;
     s.drain();
     if(!s.gpu_room(layer,s.used.size(),false)) throw std::bad_alloc();
@@ -216,7 +295,7 @@ PagedModelCache::Layer PagedModelCache::prepare_layer(std::size_t layer,int32_t 
     result.leases.reserve(result.page_count);
     auto** host=static_cast<const float**>(s.host_table);
     for(std::size_t page=0;page<result.page_count;++page) {
-        const bool current=page==std::size_t(position)/s.tokens;
+        const bool current=page>=std::size_t(first_position<0 ? position : first_position)/s.tokens && page<=std::size_t(position)/s.tokens;
         result.leases.push_back(s.cache->acquire(s.sequence,page,layer,
             current ? infer::AccessMode::WRITE : infer::AccessMode::READ,s.compute));
         host[page]=static_cast<const float*>(result.leases.back().data());
@@ -243,11 +322,26 @@ void PagedModelCache::finish_step() {
     auto& s=*impl_;s.drain();
     const auto complete=s.history.size()/s.tokens;
     if(s.options.prefix_cache && (complete>s.published || s.prefix_dirty)) {
+        if (s.pipeline) s.pipeline->flush_resident();
         s.cache->publish_prefix(s.sequence,s.history,complete);s.published=complete;s.prefix_dirty=false;
     }
 }
-void PagedModelCache::reset(bool discard_prefix) {
+bool PagedModelCache::reset(bool discard_prefix) {
     auto& s=*impl_;
+    if (s.pipeline) {
+        if (!s.reset_started) {
+            s.pipeline->begin_retire();
+            s.reset_started = true;
+        }
+        if (!s.pipeline->poll_retired()) return false;
+        s.reset_started = false;
+        s.sequence = infer::PagedKV::Sequence{};
+        s.history.clear();
+        s.published = 0;
+        s.counts.last_prefix_hit_tokens = 0;
+        if (discard_prefix) s.cache->evict_prefixes();
+        return true;
+    }
     std::exception_ptr error;
     try {s.drain();}catch(...) {error=std::current_exception();}
     const auto completed=cudaStreamSynchronize(s.compute);
@@ -255,8 +349,13 @@ void PagedModelCache::reset(bool discard_prefix) {
     if(discard_prefix || error) s.cache->evict_prefixes();
     check_cuda(completed,"Reset paged consumers");
     if(error) std::rethrow_exception(error);
+    return true;
 }
-cudaStream_t PagedModelCache::stream() const noexcept {return impl_->compute;}
+infer::AsyncKVPipeline* PagedModelCache::pipeline() const noexcept { return impl_->pipeline.get(); }
+void PagedModelCache::record_async_token() noexcept { impl_->counts.layer_calls += impl_->used.size(); }
+cudaStream_t PagedModelCache::stream() const noexcept {
+    return impl_->pipeline ? impl_->pipeline->compute_stream() : impl_->compute;
+}
 PagedModelStats PagedModelCache::stats() const {
     const auto& s=*impl_;auto result=s.counts;
     const auto gpu=s.cache->storage().stats(Location::GPU),host=s.cache->storage().stats(Location::CPU),disk=s.cache->storage().stats(Location::SSD);
@@ -265,7 +364,14 @@ PagedModelStats PagedModelCache::stats() const {
     result.gpu_limit_bytes=gpu.limit_bytes;result.host_limit_bytes=host.limit_bytes;result.ssd_limit_bytes=disk.limit_bytes;
     result.gpu_reserved_bytes=gpu.reserved_bytes;result.host_reserved_bytes=host.reserved_bytes;result.ssd_reserved_bytes=disk.reserved_bytes;
     result.gpu_peak_bytes=gpu.peak_reserved_bytes;result.host_peak_bytes=host.peak_reserved_bytes;result.ssd_peak_bytes=disk.peak_reserved_bytes;
-    result.staging_bytes=s.cache->storage().staging_stats().reserved_bytes+s.max_pages*sizeof(void*)+4096;
+    if (s.pipeline) {
+        result.gpu_reserved_bytes = result.gpu_peak_bytes = s.pipeline->reserved_device_bytes();
+        result.gpu_limit_bytes = s.options.gpu_bytes ? s.options.gpu_bytes : result.gpu_reserved_bytes;
+        result.staging_bytes = s.pipeline->staging_bytes();
+    } else {
+        result.staging_bytes=s.cache->storage().staging_stats().reserved_bytes+s.max_pages*sizeof(void*)+4096;
+    }
+    result.host_read_bytes=s.host_read_bytes.load();result.host_written_bytes=s.host_written_bytes.load();
     result.ssd_read_bytes=io.payload_read_bytes;result.ssd_written_bytes=io.payload_written_bytes;result.ssd_record_writes=io.record_writes;
     result.uring_submissions=io.file_io.submissions;result.ssd_device=io.device;return result;
 }

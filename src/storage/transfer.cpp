@@ -189,45 +189,37 @@ void copy_block(StorageState& state, LogicalBlockRecord& record, StorageBackend&
     target.publish(handle, record.meta);
 }
 
-} // namespace
-
-MigrationResult execute_transfer(StorageState& state, LogicalBlockRecord& record,
-                                 bool* quarantined) {
+MigrationResult finish_transfer(StorageState& state, LogicalBlockRecord& record,
+                                std::exception_ptr error, bool* quarantined) {
     const auto target = record.transfer->auxiliary.backend->location();
     const auto bytes = record.transfer->auxiliary.bytes;
     auto& target_tier = state.tier(target);
-    std::unique_lock<std::mutex> lock(state.mutex, std::defer_lock);
-    MigrationResult result;
+    MigrationResult result{false, false, error};
     auto& auxiliary = record.transfer->auxiliary;
     try {
-        if (!auxiliary.handle)
-            auxiliary.handle = auxiliary.backend->reserve(record.meta.size);
-        if (record.transfer->reuse_ssd_copy)
-            auxiliary.backend->validate(auxiliary.handle, record.meta);
-        else
-            copy_block(state, record, *auxiliary.backend, auxiliary.handle);
-        lock.lock();
-        // 唯一提交点：新副本已完整可读。之后清理失败也不能再宣称回滚。
-        auto& source_tier = state.tier(record.meta.location);
-        const auto source_bytes = record.backend->allocation_bytes(record.meta.size);
-        const bool retain_source =
-            state.retain_ssd_copy && record.meta.location == StorageLocation::SSD;
-        target_tier.transition(StorageCharge::MIGRATION, StorageCharge::RESIDENT, bytes);
-        source_tier.transition(StorageCharge::RESIDENT, StorageCharge::MIGRATION, source_bytes);
-        std::swap(record.allocation, auxiliary.handle);
-        std::swap(record.backend, auxiliary.backend);
-        auxiliary.bytes = source_bytes;
-        record.meta.location = target;
-        if (retain_source) {
-            // 这是额外的有效副本，而非第二个逻辑块；各层仍统一按物理槽计费。
-            record.ssd_copy = auxiliary;
-            record.ssd_copy_version = record.meta.version;
-            auxiliary = {};
-            source_tier.transition(StorageCharge::MIGRATION, StorageCharge::REPLICA, source_bytes);
+        if (!error) {
+            const auto source_bytes = record.backend->allocation_bytes(record.meta.size);
+            std::lock_guard<std::mutex> lock(state.mutex);
+            // 唯一提交点：新副本已完整可读。之后清理失败也不能再宣称回滚。
+            auto& source_tier = state.tier(record.meta.location);
+            const bool retain_source =
+                state.retain_ssd_copy && record.meta.location == StorageLocation::SSD;
+            target_tier.transition(StorageCharge::MIGRATION, StorageCharge::RESIDENT, bytes);
+            source_tier.transition(StorageCharge::RESIDENT, StorageCharge::MIGRATION, source_bytes);
+            std::swap(record.allocation, auxiliary.handle);
+            std::swap(record.backend, auxiliary.backend);
+            auxiliary.bytes = source_bytes;
+            record.meta.location = target;
+            if (retain_source) {
+                // 这是额外的有效副本，而非第二个逻辑块；各层仍统一按物理槽计费。
+                record.ssd_copy = auxiliary;
+                record.ssd_copy_version = record.meta.version;
+                auxiliary = {};
+                source_tier.transition(StorageCharge::MIGRATION, StorageCharge::REPLICA, source_bytes);
+            }
+            record.consumer_uses.clear();
+            result.committed = true;
         }
-        record.consumer_uses.clear();
-        result.committed = true;
-        lock.unlock();
     } catch (...) {
         result.error = std::current_exception();
     }
@@ -235,7 +227,7 @@ MigrationResult execute_transfer(StorageState& state, LogicalBlockRecord& record
     auto cleanup_error = cleanup_transfer(state, record);
     if (!result.error)
         result.error = cleanup_error;
-    lock.lock();
+    std::lock_guard<std::mutex> lock(state.mutex);
     result.cleanup_pending = bool(cleanup_error);
     if (record.transfer->source_quarantined && record.transfer->shared_staging) {
         // 在解除块保护前把槽交给故障记录；之后即使其他线程立即 retry/erase 也安全。
@@ -251,55 +243,155 @@ MigrationResult execute_transfer(StorageState& state, LogicalBlockRecord& record
     return result;
 }
 
-TransferSlots::TransferSlots(std::size_t slot_bytes, SSDStorageBackend* device) : bytes(slot_bytes) {
+} // namespace
+
+MigrationResult execute_transfer(StorageState& state, LogicalBlockRecord& record,
+                                 bool* quarantined) {
+    std::exception_ptr error;
+    auto& op = *record.transfer;
+    try {
+        if (!op.auxiliary.handle)
+            op.auxiliary.handle = op.auxiliary.backend->reserve(record.meta.size);
+        if (op.reuse_ssd_copy)
+            op.auxiliary.backend->validate(op.auxiliary.handle, record.meta);
+        else
+            copy_block(state, record, *op.auxiliary.backend, op.auxiliary.handle);
+    } catch (...) {
+        error = std::current_exception();
+    }
+    return finish_transfer(state, record, error, quarantined);
+}
+
+std::size_t execute_chunk_batch(StorageState& state, const std::vector<LogicalBlockRecord*>& records,
+                                std::vector<MigrationResult>& results, std::size_t first,
+                                bool& quarantined) {
+    auto* head = records[first];
+    if (!head || head->transfer->reuse_ssd_copy)
+        return first;
+    const auto source = head->meta.location;
+    const auto target = head->transfer->auxiliary.backend->location();
+    const bool write = target == StorageLocation::SSD;
+    auto* ssd = dynamic_cast<SSDStorageBackend*>(write ? head->transfer->auxiliary.backend
+                                                      : head->backend);
+    if (!ssd || !ssd->supports_chunk_io())
+        return first;
+    const bool gpu = head->transfer->gpu != nullptr;
+    const auto limit = gpu ? state.staging->bytes / state.block_bytes : records.size() - first;
+    auto end = first + 1;
+    while (end < records.size() && end - first < limit) {
+        const auto* record = records[end];
+        if (!record || record->meta.location != source || record->transfer->reuse_ssd_copy)
+            break;
+        ++end;
+    }
+    if (end - first < 2)
+        return first;
+
+    std::size_t preparing = first;
+    std::vector<void*> hosts;
+    try {
+        std::vector<StorageWrite> writes;
+        std::vector<StorageRead> reads;
+        hosts.reserve(end - first);
+        if (write) writes.reserve(end - first);
+        else reads.reserve(end - first);
+        for (; preparing < end; ++preparing) {
+            auto& record = *records[preparing];
+            auto& op = *record.transfer;
+            if (!op.auxiliary.handle)
+                op.auxiliary.handle = op.auxiliary.backend->reserve(record.meta.size);
+            auto* host = gpu
+                ? static_cast<char*>(state.staging->data[op.staging]) + (preparing - first) * state.block_bytes
+                : checked_memory_view(write ? *record.backend : *op.auxiliary.backend,
+                                      write ? record.allocation : op.auxiliary.handle,
+                                      StorageLocation::CPU, record.meta.size).data;
+            hosts.push_back(host);
+            if (!write) {
+                reads.push_back({record.allocation, record.meta, host});
+                continue;
+            }
+            record.backend->validate(record.allocation, record.meta);
+            if (gpu) {
+                op.completion_unknown = true;
+                record.backend->read(record.allocation, 0, host, record.meta.size);
+                op.completion_unknown = false;
+            }
+            writes.push_back({op.auxiliary.handle, record.meta, host});
+        }
+        if (write)
+            ssd->write_published_many(writes);
+        else
+            ssd->read_validated_many(reads);
+    } catch (...) {
+        const auto error = std::current_exception();
+        // One I/O error can cover multiple pages. Retry separately to preserve
+        // the per-page result and let healthy pages in the batch commit.
+        auto failed = end;
+        if (preparing < end && records[preparing]->transfer->completion_unknown) {
+            failed = preparing;
+            results[failed] = finish_transfer(state, *records[failed], error, &quarantined);
+        }
+        for (auto i = first; i < end; ++i) {
+            if (i == failed)
+                continue;
+            results[i] = quarantined ? finish_transfer(state, *records[i], error, &quarantined)
+                                     : execute_transfer(state, *records[i], &quarantined);
+        }
+        return end;
+    }
+    for (auto i = first; i < end; ++i) {
+        auto& record = *records[i];
+        auto& op = *record.transfer;
+        std::exception_ptr error;
+        if (quarantined) {
+            error = results[i - 1].error;
+        } else if (!write) {
+            try {
+                if (gpu) {
+                    op.completion_unknown = true;
+                    op.auxiliary.backend->write(op.auxiliary.handle, 0, hosts[i - first], record.meta.size);
+                    op.completion_unknown = false;
+                }
+                op.auxiliary.backend->publish(op.auxiliary.handle, record.meta);
+            } catch (...) {
+                error = std::current_exception();
+            }
+        }
+        results[i] = finish_transfer(state, record, error, &quarantined);
+    }
+    return end;
+}
+
+TransferSlots::TransferSlots(std::size_t slot_bytes, SSDStorageBackend* device)
+    : bytes(device && device->supports_chunk_io() ? 2 * 1024 * 1024 : slot_bytes) {
     if (bytes > std::numeric_limits<std::size_t>::max() / 2)
         throw std::overflow_error("Pinned slot capacity overflow");
 #if INFER_ENABLE_CUDA
     if (device) {
         try {
-            auto first = device->allocate_dma_buffer(bytes);
+            auto first = device->allocate_transfer_buffer(bytes);
             if (first) {
-                dma = std::make_unique<std::array<std::shared_ptr<SSDDmaBuffer>, 2>>();
-                (*dma)[0] = std::move(first);
-                (*dma)[1] = device->allocate_dma_buffer(bytes);
-                if (!(*dma)[1]) throw std::runtime_error("Incomplete device DMA staging");
+                auto second = device->allocate_transfer_buffer(bytes);
+                if (second) {
+                    dma = std::make_unique<std::array<std::shared_ptr<SSDDmaBuffer>, 2>>(
+                        std::array<std::shared_ptr<SSDDmaBuffer>, 2>{std::move(first), std::move(second)});
+                    for (std::size_t i = 0; i < data.size(); ++i)
+                        data[i] = (*dma)[i]->data();
+                    return;
+                }
             }
         } catch (const std::bad_alloc&) {
-            dma.reset(); // Older budgets cover only bounce slots; keep bounded pinned staging.
-        }
-        if (dma) {
-            std::size_t registered = 0;
-            try {
-                for (auto& buffer : *dma) {
-                    check_cuda(cudaHostRegister(buffer->data(), buffer->size(), cudaHostRegisterPortable),
-                               "Register device transfer staging");
-                    data[registered++] = buffer->data();
-                }
-            } catch (...) {
-                bool retained = false;
-                for (std::size_t i = 0; i < registered; ++i)
-                    retained |= cudaHostUnregister(data[i]) != cudaSuccess;
-                if (retained) (void)dma.release();
-                throw;
-            }
-            return;
+            // Insufficient device DMA budget: use CUDA-owned pinned staging.
         }
     }
-#else
-    (void)device;
 #endif
     CachingCPUAllocatorConfig config;
     config.max_reuse_waste = 0;
     pool = std::make_unique<CachingPinnedHostAllocator>(config);
     for (auto& ptr : data)
-        ptr = pool->allocate(bytes);
+        ptr = pool->allocate_io(bytes);
 }
 TransferSlots::~TransferSlots() {
-#if INFER_ENABLE_CUDA
-    if (dma && !quarantined)
-        for (auto* ptr : data)
-            quarantined |= cudaHostUnregister(ptr) != cudaSuccess;
-#endif
     if (quarantined) {
         // 设备故障使 DMA 完成未知；池及其内存一起保留到进程退出。
         std::fputs("Storage pinned slots quarantined until process exit\n", stderr);

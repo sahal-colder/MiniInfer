@@ -1,11 +1,17 @@
 #include "infer/storage/ssd_device.h"
+#include "infer/config.h"
 
 #include <stdexcept>
 
 #ifdef INFER_HAS_SPDK
+#if INFER_ENABLE_CUDA
+#include <cuda_runtime_api.h>
+#endif
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <future>
@@ -27,6 +33,14 @@ std::atomic<bool> app_owned{false};
 std::atomic<bool> app_retired{false};
 std::atomic<std::size_t> arena_bytes{0};
 constexpr std::size_t sector_alignment = 4096;
+#if INFER_ENABLE_CUDA
+bool register_cuda(void* address, std::size_t bytes) noexcept {
+    if (cudaHostRegister(address, bytes, cudaHostRegisterPortable) == cudaSuccess)
+        return true;
+    (void)cudaGetLastError();
+    return false;
+}
+#endif
 bool snapshot_arena() noexcept {
     if (spdk_env_dpdk_external_init())
         return false;
@@ -48,11 +62,12 @@ class SpdkDevice final : public SSDDevice, public std::enable_shared_from_this<S
         std::shared_ptr<SpdkDevice> owner;
         void* address;
         std::size_t bytes;
+        bool cuda_pinned = false;
         Buffer(std::shared_ptr<SpdkDevice> value, void* data, std::size_t size)
             : owner(std::move(value)), address(data), bytes(size) {}
         ~Buffer() override {
             if (address)
-                owner->release_buffer(address, bytes);
+                owner->release_buffer(address, bytes, cuda_pinned);
         }
         void* data() const noexcept override { return address; }
         std::size_t size() const noexcept override { return bytes; }
@@ -71,8 +86,8 @@ class SpdkDevice final : public SSDDevice, public std::enable_shared_from_this<S
         SpdkDevice* owner = nullptr;
         Batch* batch = nullptr;
         const FileIORequest* range = nullptr;
-        const FileIORequest* paired = nullptr;
-        iovec vectors[2]{};
+        std::array<iovec, 128> vectors{};
+        unsigned vector_count = 0;
         void* dma = nullptr;
         void* io_data = nullptr;
         bool direct = false;
@@ -98,26 +113,38 @@ class SpdkDevice final : public SSDDevice, public std::enable_shared_from_this<S
     std::atomic<std::uint64_t> copied_read_{0}, copied_write_{0};
     std::atomic<std::uint64_t> direct_read_{0}, direct_written_{0};
     std::size_t environment_bytes_ = 0;
+    bool cuda_dma_supported_ = false;
 
-    void release_buffer(void* data, std::size_t bytes) noexcept {
+    void release_buffer(void* data, std::size_t bytes, bool cuda_pinned) noexcept {
         std::lock_guard<std::mutex> lock(allocation_mutex_);
         buffers_.erase(reinterpret_cast<std::uintptr_t>(data));
+#if INFER_ENABLE_CUDA
+        if (cuda_pinned && cudaHostUnregister(data) != cudaSuccess) {
+            std::fputs("SPDK DMA buffer retained after CUDA unregister failure\n", stderr);
+            return;
+        }
+#else
+        (void)cuda_pinned;
+#endif
         spdk_dma_free(data);
         leased_bytes_ -= bytes;
     }
-    std::vector<std::shared_ptr<Buffer>> retain_buffers(const std::vector<FileIORequest>& ranges) {
-        std::vector<std::shared_ptr<Buffer>> result(ranges.size());
+    std::weak_ptr<Buffer> find_buffer(const void* data, std::size_t bytes) const {
         std::lock_guard<std::mutex> lock(allocation_mutex_);
-        for (std::size_t i = 0; i < ranges.size(); ++i) {
-            const auto address = reinterpret_cast<std::uintptr_t>(ranges[i].data);
-            auto found = buffers_.upper_bound(address);
-            if (found == buffers_.begin())
-                continue;
-            --found;
-            if (address - found->first <= found->second.first &&
-                ranges[i].bytes <= found->second.first - (address - found->first))
-                result[i] = found->second.second.lock();
-        }
+        const auto address = reinterpret_cast<std::uintptr_t>(data);
+        auto found = buffers_.upper_bound(address);
+        if (found == buffers_.begin())
+            return {};
+        --found;
+        const auto offset = address - found->first;
+        return offset <= found->second.first && bytes <= found->second.first - offset
+                   ? found->second.second : std::weak_ptr<Buffer>{};
+    }
+    std::vector<std::shared_ptr<Buffer>> retain_buffers(const std::vector<FileIORequest>& ranges) {
+        std::vector<std::shared_ptr<Buffer>> result;
+        result.reserve(ranges.size());
+        for (const auto& range : ranges)
+            result.push_back(find_buffer(range.data, range.bytes).lock());
         return result;
     }
 
@@ -211,12 +238,24 @@ class SpdkDevice final : public SSDDevice, public std::enable_shared_from_this<S
             self.advance(slot, EIO);
             return;
         }
+        if (slot.vector_count) {
+            const bool write = slot.phase == Phase::WRITE;
+            (write ? self.written_bytes_ : self.read_bytes_).fetch_add(slot.length, std::memory_order_relaxed);
+            for (unsigned i = 0; i < slot.vector_count; i += 2) {
+                if (!write)
+                    std::memcpy(slot.range[i].data, slot.vectors[i].iov_base, slot.range[i].bytes);
+                (write ? self.copied_write_ : self.copied_read_).fetch_add(
+                    slot.range[i].prefix_bytes + slot.range[i].bytes, std::memory_order_relaxed);
+                (write ? self.direct_written_ : self.direct_read_).fetch_add(
+                    slot.vectors[i + 1].iov_len, std::memory_order_relaxed);
+            }
+            self.advance(slot, 0);
+            return;
+        }
         if (slot.phase == Phase::WRITE) {
             self.written_bytes_.fetch_add(slot.length, std::memory_order_relaxed);
             if (slot.direct)
                 self.direct_written_.fetch_add(slot.bytes, std::memory_order_relaxed);
-            if (slot.paired)
-                self.direct_written_.fetch_add(slot.paired->bytes, std::memory_order_relaxed);
             self.advance(slot, 0);
         } else {
             self.read_bytes_.fetch_add(slot.length, std::memory_order_relaxed);
@@ -232,8 +271,6 @@ class SpdkDevice final : public SSDDevice, public std::enable_shared_from_this<S
                                 static_cast<char*>(slot.dma) + slot.prefix, slot.bytes);
                     self.copied_read_.fetch_add(slot.bytes, std::memory_order_relaxed);
                 }
-                if (slot.paired)
-                    self.direct_read_.fetch_add(slot.paired->bytes, std::memory_order_relaxed);
                 self.advance(slot, 0);
             }
         }
@@ -245,11 +282,11 @@ class SpdkDevice final : public SSDDevice, public std::enable_shared_from_this<S
         }
         // ENOMEM means no I/O was accepted. Retain the slot/batch while waiting
         // on the same SPDK channel; completion or retry owns every DMA buffer.
-        const int rc = slot.paired
+        const int rc = slot.vector_count
                            ? (slot.phase == Phase::WRITE
-                                  ? spdk_bdev_writev(desc_, channel_, slot.vectors, 2,
+                                  ? spdk_bdev_writev(desc_, channel_, slot.vectors.data(), slot.vector_count,
                                                      slot.offset, slot.length, completed, &slot)
-                                  : spdk_bdev_readv(desc_, channel_, slot.vectors, 2,
+                                  : spdk_bdev_readv(desc_, channel_, slot.vectors.data(), slot.vector_count,
                                                     slot.offset, slot.length, completed, &slot))
                            : slot.phase == Phase::WRITE
                            ? spdk_bdev_write(desc_, channel_, slot.io_data, slot.offset, slot.length,
@@ -280,39 +317,47 @@ class SpdkDevice final : public SSDDevice, public std::enable_shared_from_this<S
                         static_cast<const char*>(range.data) + (slot.position + head - range.prefix_bytes),
                         slot.bytes - head);
     }
-    bool launch_pair(Slot& slot, Batch& batch) noexcept {
-        constexpr std::size_t payload_limit = 256 * 1024;
-        if (batch.position || batch.index + 1 >= batch.ranges.size() ||
-            batch.leases[batch.index] || !batch.leases[batch.index + 1])
+    bool launch_scatter(Slot& slot, Batch& batch) noexcept {
+        constexpr std::size_t max_chunk = 2 * 1024 * 1024;
+        if (batch.position)
             return false;
-        const auto& head = batch.ranges[batch.index];
-        const auto& payload = batch.ranges[batch.index + 1];
-        if (head.offset % sector_alignment || payload.offset <= head.offset ||
-            payload.offset - head.offset != sector_alignment || payload.prefix_bytes ||
-            payload.bytes > payload_limit || payload.bytes % sector_alignment ||
-            reinterpret_cast<std::uintptr_t>(payload.data) % sector_alignment ||
-            (batch.write ? head.prefix_bytes + head.bytes != sector_alignment
-                         : head.bytes > sector_alignment))
+        slot.range = &batch.ranges[batch.index];
+        slot.offset = config_.offset_bytes + slot.range->offset;
+        slot.length = 0;
+        while (batch.index + 1 < batch.ranges.size() &&
+               slot.vector_count + 2 <= slot.vectors.size() &&
+               slot.vector_count / 2 < config_.io_buffer_bytes / sector_alignment) {
+            const auto& head = batch.ranges[batch.index];
+            const auto& payload = batch.ranges[batch.index + 1];
+            if (batch.leases[batch.index] || !batch.leases[batch.index + 1] ||
+                head.offset % sector_alignment || config_.offset_bytes + head.offset != slot.offset + slot.length ||
+                payload.offset - head.offset != sector_alignment || payload.prefix_bytes ||
+                slot.length >= max_chunk || sector_alignment + payload.bytes > max_chunk - slot.length ||
+                payload.bytes % sector_alignment ||
+                reinterpret_cast<std::uintptr_t>(payload.data) % sector_alignment ||
+                (batch.write ? head.prefix_bytes + head.bytes != sector_alignment
+                             : head.bytes > sector_alignment))
+                break;
+            auto* metadata = static_cast<char*>(slot.dma) + slot.vector_count / 2 * sector_alignment;
+            if (batch.write) {
+                if (head.prefix_bytes)
+                    std::memcpy(metadata, head.prefix, head.prefix_bytes);
+                std::memcpy(metadata + head.prefix_bytes, head.data, head.bytes);
+            }
+            slot.vectors[slot.vector_count++] = {metadata, sector_alignment};
+            slot.vectors[slot.vector_count++] = {payload.data, payload.bytes};
+            slot.length += sector_alignment + payload.bytes;
+            batch.index += 2;
+        }
+        if (!slot.vector_count)
             return false;
-        slot.range = &head;
-        slot.paired = &payload;
-        slot.position = slot.prefix = 0;
-        slot.offset = config_.offset_bytes + head.offset;
-        slot.bytes = head.prefix_bytes + head.bytes;
-        slot.length = sector_alignment + payload.bytes;
-        slot.direct = false;
         slot.phase = batch.write ? Phase::WRITE : Phase::READ;
-        slot.vectors[0] = {slot.dma, sector_alignment};
-        slot.vectors[1] = {payload.data, payload.bytes};
-        if (batch.write)
-            stage(slot);
-        batch.index += 2;
         issue(slot);
         return true;
     }
     void launch(Slot& slot, Batch& batch) noexcept {
-        slot.paired = nullptr;
-        if (launch_pair(slot, batch))
+        slot.vector_count = 0;
+        if (launch_scatter(slot, batch))
             return;
         const auto& range = batch.ranges[batch.index];
         slot.range = &range;
@@ -368,6 +413,13 @@ class SpdkDevice final : public SSDDevice, public std::enable_shared_from_this<S
         }
         for (auto& slot : slots_)
             if (slot.dma) {
+#if INFER_ENABLE_CUDA
+                if (&slot == &slots_.front() && cuda_dma_supported_ &&
+                    cudaHostUnregister(slot.dma) != cudaSuccess) {
+                    std::fputs("SPDK CUDA probe buffer retained after unregister failure\n", stderr);
+                    continue;
+                }
+#endif
                 spdk_dma_free(slot.dma);
                 slot.dma = nullptr;
             }
@@ -406,6 +458,11 @@ class SpdkDevice final : public SSDDevice, public std::enable_shared_from_this<S
             if (!self.environment_bytes_ ||
                 self.environment_bytes_ > (std::uint64_t(self.config_.environment_mib) << 20))
                 throw std::runtime_error("SPDK environment exceeds its configured budget");
+#if INFER_ENABLE_CUDA
+            // Probe real EAL-backed memory, which CUDA may refuse even when a GPU is present.
+            self.cuda_dma_supported_ = register_cuda(self.slots_.front().dma,
+                                                     self.config_.io_buffer_bytes);
+#endif
             self.thread_ = spdk_get_thread();
             self.started_.set_value();
         } catch (...) {
@@ -512,6 +569,28 @@ class SpdkDevice final : public SSDDevice, public std::enable_shared_from_this<S
                 copied_read_.load(), copied_write_.load(), direct_read_.load(), direct_written_.load()};
     }
     std::shared_ptr<SSDDmaBuffer> allocate_dma_buffer(std::size_t bytes) override {
+        return allocate_buffer(bytes);
+    }
+    bool owns_dma_range(const void* data, std::size_t bytes) const override {
+        return !find_buffer(data, bytes).expired();
+    }
+    std::shared_ptr<SSDDmaBuffer> allocate_transfer_buffer(std::size_t bytes) override {
+#if INFER_ENABLE_CUDA
+        if (cuda_dma_supported_) {
+            auto buffer = allocate_buffer(bytes);
+            if (register_cuda(buffer->data(), buffer->size())) {
+                buffer->cuda_pinned = true;
+                return buffer;
+            }
+        }
+#else
+        (void)bytes;
+#endif
+        return {};
+    }
+
+  private:
+    std::shared_ptr<Buffer> allocate_buffer(std::size_t bytes) {
         if (!bytes || bytes > SIZE_MAX - sector_alignment + 1)
             throw std::invalid_argument("Invalid SPDK DMA allocation size");
         const auto rounded = (bytes + sector_alignment - 1) / sector_alignment * sector_alignment;
@@ -559,6 +638,12 @@ class SpdkDeviceHandle final : public SSDDevice {
     SSDDeviceStats stats() const override { return device_->stats(); }
     std::shared_ptr<SSDDmaBuffer> allocate_dma_buffer(std::size_t bytes) override {
         return device_->allocate_dma_buffer(bytes);
+    }
+    bool owns_dma_range(const void* data, std::size_t bytes) const override {
+        return device_->owns_dma_range(data, bytes);
+    }
+    std::shared_ptr<SSDDmaBuffer> allocate_transfer_buffer(std::size_t bytes) override {
+        return device_->allocate_transfer_buffer(bytes);
     }
 };
 } // namespace

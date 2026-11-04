@@ -2,6 +2,7 @@
 #include "mini_infer/model/mini_infer_model_options.h"
 #include "mini_infer/loader/mini_infer_mmap.h"
 #include "mini_infer/tensor/mini_infer_tensor.h"
+#include "infer/storage/async_kv_pipeline.h"
 #include "infer/storage/paged_kv.h"
 namespace mini_infer {
 // Single-request scheduler. PrefixIndex survives reset; consumers remain pinned
@@ -19,10 +20,14 @@ class PagedModelCache {
     ~PagedModelCache();
     std::size_t begin_request(const int32_t* tokens,std::size_t count);
     void begin_token(int32_t token,int32_t position);
-    Layer prepare_layer(std::size_t layer,int32_t position);
+    void begin_batch(const int32_t* tokens, std::size_t count, int32_t position);
+    Layer prepare_layer(std::size_t layer,int32_t position, int32_t first_position = -1);
     void prefetch_next(std::size_t layer,std::size_t protected_layer);
     void finish_step();
-    void reset(bool discard_prefix=false);
+    // Async mode fences once and returns false while callbacks or DMA are live.
+    bool reset(bool discard_prefix=false);
+    infer::AsyncKVPipeline* pipeline() const noexcept;
+    void record_async_token() noexcept;
     cudaStream_t stream() const noexcept;
     PagedModelStats stats() const;
   private:

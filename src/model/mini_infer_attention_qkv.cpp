@@ -105,8 +105,10 @@ std::pair<Tensor, Tensor> AttentionQKV::forward(
 }  // namespace mini_infer
 namespace mini_infer {
 void AttentionQKV::forward_into(const Tensor& input,Tensor& query,Tensor& key,Tensor& value,cudaStream_t stream) {
-    if(input.dims()!=std::vector<int32_t>{dim_} || query.dims()!=std::vector<int32_t>{dim_} ||
-       key.dims()!=std::vector<int32_t>{kv_dim_} || value.dims()!=key.dims())
+    auto key_shape = input.dims();
+    key_shape.back() = kv_dim_;
+    if(input.dims().back()!=dim_ || query.dims()!=input.dims() ||
+       key.dims()!=key_shape || value.dims()!=key.dims())
         throw std::invalid_argument("Paged QKV dimensions do not match projection weights");
     query_layer_.set_input(0,input);query_layer_.set_output(0,query);
     key_layer_.set_input(0,input);key_layer_.set_output(0,key);

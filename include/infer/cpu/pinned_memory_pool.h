@@ -16,6 +16,7 @@ class CachingPinnedHostAllocator final : public DeviceAllocator {
     CachingPinnedHostAllocator(const CachingPinnedHostAllocator&) = delete;
     CachingPinnedHostAllocator& operator=(const CachingPinnedHostAllocator&) = delete;
     void* allocate(std::size_t size, cudaStream_t stream = nullptr) const override;
+    void* allocate_io(std::size_t size) const;
     void release(void* ptr, cudaStream_t stream = nullptr) const override;
     CPUMemoryPoolStats stats() const;
     void trim() const;
