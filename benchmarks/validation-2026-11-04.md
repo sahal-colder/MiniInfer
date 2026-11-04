@@ -98,6 +98,9 @@ active-block utilization must not be presented as whole-pool utilization.
 - B-host native rows recorded both pinned host reads and writes. B-nvme native
   rows recorded SSD reads during prefill. No Nsight/CUPTI overlap trace was taken.
 - CUDA CTest: 15 passed, four SPDK tests skipped because SPDK was not enabled.
+- Publication build additionally enabled the C API and preload library:
+  17 CTest cases passed, four SPDK cases skipped, including both C io_uring
+  submission-wave and fixed-buffer tests.
 - CPU-only CTest: two passed, one SPDK test skipped. Both configurations were
   rerun before publication without failures.
 - Tests cover sequential-versus-batched logits, partial-page appends, prefix
