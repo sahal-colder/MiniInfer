@@ -32,11 +32,12 @@ struct StorageConfig {
     FileIOConfig ssd_io;
     HostMemoryKind cpu_memory =
         HostMemoryKind::PAGEABLE; // PINNED 复用已有锁页池，按 cpu_bytes 限额。
-    SSDVerification ssd_verification = SSDVerification::READ_BACK;
+    SSDVerification ssd_verification = default_ssd_verification;
     SpdkBdevConfig ssd_spdk;
     bool variable_cpu_slots =
         false; // CPU charges size-class capacity; SSD address slots stay fixed.
     bool mapped_cpu_pool = false; // Optional contiguous batches for the full record size class.
+    bool ssd_direct = false; // Strict io_uring + O_DIRECT private file, v2 aligned records.
 };
 struct StorageUsage {
     std::size_t limit_bytes = 0;

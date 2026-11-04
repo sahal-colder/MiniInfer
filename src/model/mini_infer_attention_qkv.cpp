@@ -103,3 +103,20 @@ std::pair<Tensor, Tensor> AttentionQKV::forward(
 }
 
 }  // namespace mini_infer
+namespace mini_infer {
+void AttentionQKV::forward_into(const Tensor& input,Tensor& query,Tensor& key,Tensor& value,cudaStream_t stream) {
+    if(input.dims()!=std::vector<int32_t>{dim_} || query.dims()!=std::vector<int32_t>{dim_} ||
+       key.dims()!=std::vector<int32_t>{kv_dim_} || value.dims()!=key.dims())
+        throw std::invalid_argument("Paged QKV dimensions do not match projection weights");
+    query_layer_.set_input(0,input);query_layer_.set_output(0,query);
+    key_layer_.set_input(0,input);key_layer_.set_output(0,key);
+    value_layer_.set_input(0,input);value_layer_.set_output(0,value);
+    query_layer_.check();key_layer_.check();value_layer_.check();
+    for(const Tensor* output:{&query,&key,&value})
+        for(const MatmulLayer* layer:{&query_layer_,&key_layer_,&value_layer_})
+            if(output->overlaps(layer->get_weight(0))) throw std::invalid_argument("Paged QKV overlaps projection weights");
+    if(query.overlaps(key)||query.overlaps(value)||key.overlaps(value))
+        throw std::invalid_argument("Paged QKV outputs overlap");
+    query_layer_.forward(stream);key_layer_.forward(stream);value_layer_.forward(stream);
+}
+}

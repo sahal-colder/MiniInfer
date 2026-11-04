@@ -1,4 +1,4 @@
-"""Experimental single-rank vLLM 0.31 adapter; no changes to installed vLLM.
+"""Experimental single-rank vLLM 0.31/0.32 adapter; no changes to installed vLLM.
 
 Reuses vLLM's scheduler, block matching and batch DMA primitive, with packed
 Pinned staging and reusable descriptors/events. The backing store belongs to
@@ -10,6 +10,7 @@ from collections import deque
 from importlib.metadata import version
 import json
 import operator
+import queue
 import os
 from pathlib import Path
 import threading
@@ -21,7 +22,6 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector import (
     SimpleCPUOffloadConnector,
 )
-from vllm.v1.simple_kv_offload.disk_backend import DiskBackend
 from vllm.v1.simple_kv_offload.cuda_mem_ops import (
     build_params,
     copy_blocks,
@@ -29,6 +29,8 @@ from vllm.v1.simple_kv_offload.cuda_mem_ops import (
     CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
 )
 from packed_dma import PackedDMACopy
+from native_transfer import NativeTransfer
+from vllm.platforms import current_platform
 from timing import CUDASpanMetrics
 
 BACKENDS = []
@@ -66,8 +68,11 @@ class NativeStore:
             raise RuntimeError(self.lib.mi_storage_error().decode())
         self._payload, self._count = payload, count
         self.file_slot_bytes = max(4096, 1 << (payload - 1).bit_length()) + 64
+        if os.environ.get("MINIINFER_SPDK_BDEV") or os.environ.get("MINIINFER_FILE_IO") == "direct":
+            self.file_slot_bytes = (self.file_slot_bytes + 4095) // 4096 * 4096
 
     def _bind(self, prefix, library=None):
+        self._prefix = prefix
         path = Path(
             os.environ.get(
                 "MINIINFER_BRIDGE",
@@ -183,10 +188,12 @@ class NativeStore:
             self.ptr = None
 
 
-class MiniInferDiskBackend(DiskBackend):
+class MiniInferDiskBackend:
     def __init__(self, store_factory=NativeStore):
-        super().__init__()
         self.store_factory = store_factory
+        self._store_queue = queue.SimpleQueue()
+        self._load_queue = queue.SimpleQueue()
+        self._shutdown = False
 
     def init(
         self,
@@ -215,11 +222,73 @@ class MiniInferDiskBackend(DiskBackend):
         self._tensor_names = list(gpu_caches)
         self._per_tensor_bpb = [t.stride(0) * t.element_size() for t in gpu_caches.values()]
         assert sum(self._per_tensor_bpb) == total_block_bytes
-        # 一个连续 Pinned 槽按 layer 切视图：不再打包/解包普通 CPU 临时缓冲。
-        self._store_buffer = torch.empty(
-            (num_buffer_slots, total_block_bytes), dtype=torch.int8, pin_memory=True
+        self.store = (store_factory or self.store_factory)(
+            total_block_bytes, num_disk_slots, str(Path(disk_path).parent)
         )
-        self._load_buffer = torch.empty_like(self._store_buffer, pin_memory=True)
+        self._native_read_ahead = self.store.prefetch_enabled
+        self._store_buffer = self._load_buffer = None
+        self._native_transfer = None
+        try:
+            self._prepare_staging(gpu_caches, num_buffer_slots, total_block_bytes,
+                                  store_stream, load_stream)
+        except BaseException:
+            if self._native_transfer is not None:
+                self._native_transfer.close()
+            self._store_buffer = self._load_buffer = None
+            self.store.close()
+            raise
+        self.counts = dict(
+            store_blocks=0,
+            load_blocks=0,
+            store_bytes=0,
+            load_bytes=0,
+            read_ahead_batches=0,
+            read_ahead_bytes=0,
+            native_transfer_calls=0,
+        )
+        self.completed_timings = deque(maxlen=256)
+        self._failure = None
+        self._pending = 0
+        self._pending_condition = threading.Condition()
+        self.capacity = dict(
+            payload_bytes_per_block=total_block_bytes,
+            disk_slots=num_disk_slots,
+            file_slot_bytes=self.store.file_slot_bytes,
+            reuse_dma=self._reuse_dma,
+            native_transfer_executor=self._native_transfer is not None,
+            staging_in_device=self._staging_in_device,
+            pinned_read_ahead=self._native_read_ahead,
+            pinned_tensor_bytes=self._store_buffer.nbytes + self._load_buffer.nbytes,
+        )
+        self._store_thread = threading.Thread(
+            target=self._guard, args=(self._transfer_loop, device, store_stream, True), daemon=True
+        )
+        self._load_thread = threading.Thread(
+            target=self._guard, args=(self._transfer_loop, device, load_stream, False), daemon=True
+        )
+        self._store_thread.start()
+        self._load_thread.start()
+        BACKENDS.append(self)
+
+    def _prepare_staging(self, gpu_caches, num_buffer_slots, total_block_bytes,
+                         store_stream, load_stream):
+        # 一个连续 Pinned 槽按 layer 切视图：不再打包/解包普通 CPU 临时缓冲。
+        self._staging_in_device = bool(os.environ.get("MINIINFER_SPDK_BDEV"))
+        if self._staging_in_device:
+            from native_staging import tensor
+
+            prefix = "mi_tiered" if self.store._prefix == "mi_tiered" else "mi_store"
+            self._store_buffer = tensor(self.store.lib, self.store.ptr,
+                                        (num_buffer_slots, total_block_bytes), torch.int8,
+                                        prefix=prefix)
+            self._load_buffer = tensor(self.store.lib, self.store.ptr,
+                                       (num_buffer_slots, total_block_bytes), torch.int8,
+                                       prefix=prefix)
+        else:
+            self._store_buffer = torch.empty(
+                (num_buffer_slots, total_block_bytes), dtype=torch.int8, pin_memory=True
+            )
+            self._load_buffer = torch.empty_like(self._store_buffer, pin_memory=True)
         # 每个缓冲槽建一次 descriptor，槽内各 layer 的长度与 GPU block stride 相同。
         # copy_blocks 的 CPU block id 固定为 0；实际槽由 descriptor 的基址选择。
         self.store_params, self.load_params = [], []
@@ -259,39 +328,18 @@ class MiniInferDiskBackend(DiskBackend):
         # 对调度器发布的完成事件仍独立创建，不能在其消费之前重新 record。
         self._store_buffer_events = [torch.Event(), torch.Event()] if self._reuse_dma else None
         self._load_buffer_events = [torch.Event(), torch.Event()] if self._reuse_dma else None
-        self.store = (store_factory or self.store_factory)(
-            total_block_bytes, num_disk_slots, str(Path(disk_path).parent)
-        )
-        self._native_read_ahead = self.store.prefetch_enabled
-        self.counts = dict(
-            store_blocks=0,
-            load_blocks=0,
-            store_bytes=0,
-            load_bytes=0,
-            read_ahead_batches=0,
-            read_ahead_bytes=0,
-        )
-        self.completed_timings = deque(maxlen=256)
-        self._failure = None
-        self._pending = 0
-        self._pending_condition = threading.Condition()
-        self.capacity = dict(
-            payload_bytes_per_block=total_block_bytes,
-            disk_slots=num_disk_slots,
-            file_slot_bytes=self.store.file_slot_bytes,
-            reuse_dma=self._reuse_dma,
-            pinned_read_ahead=self._native_read_ahead,
-            pinned_tensor_bytes=self._store_buffer.nbytes + self._load_buffer.nbytes,
-        )
-        self._store_thread = threading.Thread(
-            target=self._guard, args=(self._transfer_loop, device, store_stream, True), daemon=True
-        )
-        self._load_thread = threading.Thread(
-            target=self._guard, args=(self._transfer_loop, device, load_stream, False), daemon=True
-        )
-        self._store_thread.start()
-        self._load_thread.start()
-        BACKENDS.append(self)
+        # Keep DMA ownership across requests; only buffer reuse needs a host wait.
+        self._load_pending_events = [None, None]
+        native = os.environ.get("MINIINFER_NATIVE_TRANSFERS", "1")
+        if native not in ("0", "1"):
+            raise ValueError("MINIINFER_NATIVE_TRANSFERS must be 0 or 1")
+        if (native == "1" and self._reuse_dma and not self.timings.enabled
+                and current_platform.is_cuda() and isinstance(self.store, NativeStore)
+                and NativeTransfer.available(self.store)):
+            self._native_transfer = NativeTransfer(
+                self.store, gpu_caches, num_buffer_slots, self._store_buffer, self._load_buffer,
+                store_stream, load_stream, self._packed_load.max_descriptors,
+            )
 
     def _guard(self, method, *args):
         try:
@@ -305,14 +353,15 @@ class MiniInferDiskBackend(DiskBackend):
         if self._failure:
             raise RuntimeError("MiniInfer background transfer failed") from self._failure
 
-    def launch_copy(self, *args, **kwargs):
+    def launch_copy(self, src_blocks, dst_blocks, is_store, event_idx, events_list, wait_event=None):
         with self._pending_condition:
             self.check()
             if self._shutdown:
                 raise RuntimeError("MiniInfer backend is shut down")
             self._pending += 1
             try:
-                super().launch_copy(*args, **kwargs)
+                pending = self._store_queue if is_store else self._load_queue
+                pending.put((src_blocks, dst_blocks, event_idx, events_list, wait_event))
             except BaseException:
                 self._pending -= 1
                 self._pending_condition.notify_all()
@@ -329,7 +378,10 @@ class MiniInferDiskBackend(DiskBackend):
             if wait_event is not None:
                 stream.wait_event(wait_event)
             begin = time.perf_counter_ns()
-            (self._do_store if store else self._do_load)(src, dst, stream)
+            if self._native_transfer is not None:
+                self._native_transfer.execute(src, dst, store, self.counts, self._total_block_bytes)
+            else:
+                (self._do_store if store else self._do_load)(src, dst, stream)
             elapsed = time.perf_counter_ns() - begin
             event = torch.Event()
             event.record(stream)
@@ -350,14 +402,10 @@ class MiniInferDiskBackend(DiskBackend):
     def _do_store(self, gpu_blocks, disk_slots, stream):
         assert len(gpu_blocks) == len(disk_slots)
         batch = self._num_buffer_slots // 2
-        dma, operations = [None, None], [None, None]
+        dma = [None, None]
         try:
             for i in range(0, len(gpu_blocks), batch):
                 group = (i // batch) % 2
-                if operations[group] is not None:
-                    operation = operations[group]
-                    operations[group] = None
-                    self._finish_window(operation, True)
                 first = group * batch
                 gpu = gpu_blocks[i : i + batch]
                 self._timed_copy_batch(gpu, first, True, stream)
@@ -367,44 +415,27 @@ class MiniInferDiskBackend(DiskBackend):
                     event,
                     list(zip(range(first, first + len(gpu)), disk_slots[i : i + batch])),
                 )
-                # The next D2H window is already submitted while native I/O consumes the last.
+                # The next D2H is queued while this worker writes the previous window.
                 other = 1 - group
                 if dma[other] is not None:
                     event, targets = dma[other]
                     self._wait_dma(event, True)
-                    operations[other] = self._submit_io_window(targets, True)
+                    self._io_slots(targets, True)
                     dma[other] = None
             for group in range(2):
                 if dma[group] is not None:
                     event, targets = dma[group]
                     self._wait_dma(event, True)
-                    operations[group] = self._submit_io_window(targets, True)
-                    dma[group] = None
-            for group in range(2):
-                if operations[group] is not None:
-                    operation = operations[group]
-                    operations[group] = None
-                    self._finish_window(operation, True)
-        finally:
-            # Drain every accepted native job before returning any Pinned half, even on failure.
-            try:
-                failure = None
-                for operation in operations:
-                    if operation is not None:
-                        try:
-                            operation[0].result()
-                        except BaseException as error:
-                            if failure is None:
-                                failure = error
-                if failure is not None:
-                    raise failure
-            finally:
-                stream.synchronize()
+                    self._io_slots(targets, True)
+        except BaseException:
+            # Synchronous I/O has joined its jobs; queued DMA still owns the Pinned halves.
+            stream.synchronize()
+            raise
 
     def _do_load(self, disk_slots, gpu_blocks, stream):
         assert len(gpu_blocks) == len(disk_slots)
         batch = self._num_buffer_slots // 2
-        events = [None, None]
+        events = self._load_pending_events
         pending = None
 
         def targets(offset):
@@ -413,8 +444,6 @@ class MiniInferDiskBackend(DiskBackend):
             return list(zip(range(first, first + len(slots)), slots))
 
         try:
-            if self._native_read_ahead and disk_slots:
-                pending = self._submit_window(targets(0), None)
             for i in range(0, len(disk_slots), batch):
                 group = (i // batch) % 2
                 first_slot = group * batch
@@ -438,7 +467,7 @@ class MiniInferDiskBackend(DiskBackend):
                 event = self._load_buffer_events[group] if self._reuse_dma else torch.Event()
                 event.record(stream)
                 events[group] = event
-        finally:
+        except BaseException:
             # A failed DMA/submission must not leave a reader writing into a
             # window that shutdown or the scheduler can reclaim.
             try:
@@ -447,6 +476,7 @@ class MiniInferDiskBackend(DiskBackend):
             finally:
                 # Also cover a copy enqueued before event.record failed.
                 stream.synchronize()
+            raise
 
     def _submit_window(self, targets, previous_dma):
         if previous_dma is not None:
@@ -562,19 +592,22 @@ class MiniInferDiskBackend(DiskBackend):
             thread.join()
         self._store_stream.synchronize()
         self._load_stream.synchronize()
-        self.store.close()
-        # 完成等待之后放掉 tensor 所有权；全局统计档案不应保活 Pinned 缓冲。
+        if self._native_transfer is not None:
+            self._native_transfer.close()
+            self._native_transfer = None
+        # Release owned staging before closing its allocator; external aliases
+        # retain their native lease independently until their final consumer ends.
         self._store_buffer = self._load_buffer = None
+        self.store.close()
         self._packed_store = self._packed_load = None
         self._store_buffer_events = self._load_buffer_events = None
-        self._store_buffer_caches.clear()
-        self._load_buffer_caches.clear()
+        self._load_pending_events = None
 
 
 class MiniInferConnector(SimpleCPUOffloadConnector):
     def __init__(self, vllm_config, role, kv_cache_config):
-        if version("vllm") != "0.31.0":
-            raise RuntimeError("Experimental connector requires tested vLLM 0.31.0")
+        if version("vllm") not in ("0.31.0", "0.32.0"):
+            raise RuntimeError("Experimental connector requires vLLM 0.31.0 or 0.32.0")
         if vllm_config.parallel_config.world_size != 1:
             raise ValueError("Benchmark connector validated only for world_size=1")
         super().__init__(vllm_config, role, kv_cache_config)

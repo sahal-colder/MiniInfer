@@ -3,6 +3,7 @@
 #include "mini_infer/model/mini_infer_attention_qkv.h"
 #include "mini_infer/model/mini_infer_mlp.h"
 #include "mini_infer/loader/mini_infer_mmap.h"
+#include "infer/io/weight_io.h"
 
 namespace mini_infer {
 
@@ -14,6 +15,7 @@ struct TransformerWeights {
 };
 
 struct ModelWeights {
+    infer::io::LoadStats loading;
     ModelConfig config;     // 对外 vocab_size 已变为正数。
     Tensor embedding;       // [vocab_size,dim]
     std::vector<TransformerWeights> layers;
@@ -27,8 +29,17 @@ struct ModelWeights {
 // 正 vocab 表示共享 classifier，负 vocab 表示文件末尾另有 classifier。
 // 两张旧 RoPE 表必须存在，但运行时按 theta=10000 重新计算旋转角度。
 // 本格式不含可变 epsilon/theta，固定为 Llama 2 的 1e-5 / 10000。
-// 不直接接受 GGUF、safetensors、量化文件或新版带 magic 的 checkpoint。
+// .safetensors 转到下方具名 FP32/配置元数据加载器；其余为 legacy 格式。
+// 不直接接受 GGUF、量化文件或新版带 magic 的 checkpoint。
 // 全文件大小通过后才分配权重；复制到自有 Tensor，函数返回即可解除 mmap。
 ModelWeights load_model_weights(const std::string& path,
                                 std::shared_ptr<DeviceAllocator> allocator);
 }  // namespace mini_infer
+
+namespace mini_infer {
+// Named FP32 Safetensors with miniinfer.layout=llama2c-f32-v0 and config
+// metadata. Allocates owned CUDA tensors, then loads all ranges through the
+// direct-I/O pipeline; does not map the checkpoint or retain a CPU weight copy.
+ModelWeights load_safetensors_weights(const std::string& path,
+                                     std::shared_ptr<DeviceAllocator> allocator);
+}

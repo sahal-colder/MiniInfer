@@ -37,9 +37,22 @@ if(INFER_ENABLE_SPDK)
         list(PREPEND CMAKE_PREFIX_PATH "${INFER_SPDK_ROOT}" "${INFER_SPDK_ROOT}/build")
     endif()
     find_package(PkgConfig REQUIRED)
-    pkg_check_modules(INFER_SPDK REQUIRED
+    option(INFER_SPDK_URING "Link the optional SPDK uring bdev (not required for NVMe)" OFF)
+    set(INFER_SPDK_MODULES
         spdk_event spdk_event_bdev spdk_event_iobuf spdk_bdev_nvme
-        spdk_bdev_malloc spdk_bdev_uring spdk_env_dpdk spdk_syslibs liburing>=2.3)
+        spdk_bdev_malloc spdk_env_dpdk spdk_syslibs)
+    if(INFER_SPDK_URING)
+        list(APPEND INFER_SPDK_MODULES spdk_bdev_uring liburing>=2.3)
+    endif()
+    set(INFER_SPDK_SAVED_PKG_CONFIG_PATH "$ENV{PKG_CONFIG_PATH}")
+    if(INFER_SPDK_ROOT)
+        set(ENV{PKG_CONFIG_PATH}
+            "${INFER_SPDK_ROOT}/build/lib/pkgconfig:${INFER_SPDK_ROOT}/lib/pkgconfig:${INFER_SPDK_ROOT}/lib64/pkgconfig:$ENV{PKG_CONFIG_PATH}")
+        # Re-resolve an explicit SDK when reconfiguring an existing build.
+        set(INFER_SPDK_FOUND FALSE)
+    endif()
+    pkg_check_modules(INFER_SPDK REQUIRED ${INFER_SPDK_MODULES})
+    set(ENV{PKG_CONFIG_PATH} "${INFER_SPDK_SAVED_PKG_CONFIG_PATH}")
     add_library(infer_spdk INTERFACE)
     target_include_directories(infer_spdk INTERFACE ${INFER_SPDK_INCLUDE_DIRS})
     target_link_directories(infer_spdk INTERFACE ${INFER_SPDK_LIBRARY_DIRS})

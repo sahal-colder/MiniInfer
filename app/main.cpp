@@ -24,9 +24,14 @@ int main(int argc, char** argv) {
         else allocator = std::make_shared<CPUDeviceAllocator>();
 
         // 2. mmap 读取完整模型；Tokenizer 与模型必须来自同一个词表。
-        LlamaModel model(options.model_path, allocator);
+        LlamaModel model(options.model_path, allocator, options.model_options);
         Tokenizer tokenizer(options.tokenizer_path, model.config().vocab_size);
         Sampler sampler(options.temperature, options.top_k, options.seed);
+        const auto& weight_io = model.weight_io_stats();
+        if (!weight_io.backend.empty())
+            std::cerr << "weights_io=" << weight_io.backend
+                      << " gds_p2p_verified=" << weight_io.p2p_verified
+                      << " fallback=" << weight_io.fallback_reason << '\n';
         std::cerr << "MiniInfer | " << options.device << " | dim=" << model.config().dim
                   << " | layers=" << model.config().layer_num
                   << " | context=" << model.config().seq_len << '\n';
@@ -49,6 +54,11 @@ int main(int argc, char** argv) {
         std::cerr << "prompt_tokens=" << result.prompt_tokens
                   << " generated_tokens=" << result.generated_tokens.size()
                   << " stop=" << result.stop_reason << " request_seconds=" << seconds << '\n';
+        const auto kv = model.paged_stats();
+        std::cerr << "kv_backend=" << (model.uses_paged_kv() ? options.storage_engine : "contiguous")
+                  << " kv_ssd_read_bytes=" << kv.ssd_read_bytes
+                  << " kv_ssd_written_bytes=" << kv.ssd_written_bytes
+                  << " ssd_device_ios=" << kv.ssd_device.completed_ios << '\n';
         return 0; // RAII 依次释放模型 Tensor、KVCache、显存池。
     } catch (const std::exception& error) {
         std::cerr << "MiniInfer error: " << error.what() << '\n';

@@ -20,16 +20,19 @@ class HostIOQueue {
   public:
     using Work =
         std::function<void(bool, const std::vector<std::size_t>&, const std::vector<void*>&)>;
-    explicit HostIOQueue(Work work, std::size_t bytes) : work_(std::move(work)), bytes_(bytes) {}
+    explicit HostIOQueue(Work work, std::size_t bytes, std::size_t concurrency=1)
+        : work_(std::move(work)), bytes_(bytes), concurrency_(concurrency) {
+        if(concurrency!=1 && concurrency!=4) throw std::invalid_argument("Native I/O concurrency must be 1 or 4");
+    }
     ~HostIOQueue() {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             stopping_ = true;
         }
         ready_.notify_all();
-        for (auto& worker : workers_)
-            if (worker.joinable())
-                worker.join();
+        for (auto& direction : workers_)
+            for (auto& worker : direction)
+                if (worker.joinable()) worker.join();
     }
     std::uint64_t submit(bool write, std::vector<std::size_t> slots, std::vector<void*> buffers) {
         auto job = std::make_shared<Job>();
@@ -39,8 +42,9 @@ class HostIOQueue {
         std::lock_guard<std::mutex> lock(mutex_);
         if (stopping_ || jobs_.size() >= 16 || !next_)
             throw std::runtime_error("Native I/O queue is full or stopping");
-        if (!workers_[write].joinable())
-            workers_[write] = std::thread([this, write] { run(write); });
+        for(std::size_t lane=0;lane<concurrency_;++lane)
+            if(!workers_[write][lane].joinable())
+                workers_[write][lane]=std::thread([this, write] { run(write); });
         const auto token = next_++;
         jobs_.emplace(token, job);
         peak_ = std::max(peak_, jobs_.size());
@@ -133,7 +137,7 @@ class HostIOQueue {
                 buffers.insert(buffers.end(), group[0]->buffers.begin(), group[0]->buffers.end());
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    while (count < group.size()) {
+                    while (concurrency_==1 && count < group.size()) {
                         const auto next = ready_job(write);
                         if (next == jobs_.end() || slots.size() + next->second->slots.size() > 64)
                             break;
@@ -159,11 +163,11 @@ class HostIOQueue {
         }
     }
     Work work_;
-    std::size_t bytes_, peak_ = 0;
+    std::size_t bytes_, concurrency_, peak_ = 0;
     mutable std::mutex mutex_;
     std::condition_variable ready_;
     std::map<std::uint64_t, std::shared_ptr<Job>> jobs_;
-    std::array<std::thread, 2> workers_;
+    std::array<std::array<std::thread,4>,2> workers_;
     std::uint64_t next_ = 1;
     bool stopping_ = false;
 };

@@ -1,7 +1,7 @@
 @PACKAGE_INIT@
 include(CMakeFindDependencyMacro)
 find_dependency(Infer CONFIG)
-foreach(name memory storage mini_infer_memory mini_infer)
+foreach(name memory io storage mini_infer_memory mini_infer native_compute)
     if(TARGET Infer::${name} AND NOT TARGET MiniInfer::${name})
         add_library(MiniInfer::${name} INTERFACE IMPORTED)
         set_target_properties(MiniInfer::${name} PROPERTIES INTERFACE_LINK_LIBRARIES Infer::${name})

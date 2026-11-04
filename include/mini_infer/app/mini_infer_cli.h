@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <ostream>
 #include <string>
+#include "mini_infer/model/mini_infer_model_options.h"
 
 namespace mini_infer {
 // 参数解析独立出来，让 main 只展示推理主线。
@@ -16,6 +17,8 @@ struct InferenceOptions {
     int32_t top_k = 0;
     uint32_t seed = 42;
     bool help = false;
+    std::string storage_engine = "uring";
+    ModelOptions model_options;
 };
 InferenceOptions parse_inference_options(int argc, char** argv);
 void print_inference_help(std::ostream& output);

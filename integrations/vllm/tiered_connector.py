@@ -100,7 +100,7 @@ class NativeTieredStore(NativeStore):
         self.lib.mi_tiered_prefetch_drain.argtypes = [ctypes.c_void_p]
         self.lib.mi_tiered_prefetch_drain.restype = ctypes.c_int
         self.batch_io = os.environ.get("MINIINFER_BATCH_IO", "1") != "0"
-        mode = {"auto": 0, "posix": 1, "uring": 2}[os.environ.get("MINIINFER_FILE_IO", "posix")]
+        mode = {"auto": 0, "posix": 1, "uring": 2, "direct": 2}[os.environ.get("MINIINFER_FILE_IO", "posix")]
         depth = int(os.environ.get("MINIINFER_IO_DEPTH", "8"))
         writes = int(os.environ.get("MINIINFER_WRITE_CONCURRENCY", "4"))
         self.ptr = self.lib.mi_tiered_create_options(
@@ -203,6 +203,7 @@ class MiniInferTieredConnector(MiniInferConnector):
                     (int(os.environ.get("MINIINFER_SPDK_MEM_MIB", "256")) << 20)
                     if os.environ.get("MINIINFER_SPDK_BDEV")
                     else 0,
+                    staging_in_device=bool(os.environ.get("MINIINFER_SPDK_BDEV")),
                 )
             )
         if self.cpu_resident:

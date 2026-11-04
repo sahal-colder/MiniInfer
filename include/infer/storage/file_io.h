@@ -33,6 +33,10 @@ struct FileIOStats {
     std::uint64_t submissions = 0, completions = 0, completion_waits = 0;
     std::size_t peak_inflight = 0;
     std::size_t rings = 0;
+    std::uint64_t fixed_buffer_operations = 0, ordinary_buffer_operations = 0;
+    std::size_t buffer_registration_failures = 0, buffer_window_registrations = 0;
+    unsigned setup_flags = 0;
+    std::size_t registered_buffer_bytes = 0, hugetlb_pools = 0;
 };
 
 // Bounded asynchronous file reads/writes. Callers retain fd and buffers until

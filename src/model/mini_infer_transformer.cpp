@@ -1,6 +1,8 @@
 #include "mini_infer/model/mini_infer_transformer.h"
 #include "mini_infer/ops/mini_infer_rope.h"
 #include <stdexcept>
+#include "infer/storage/paged_attention.h"
+#include "mini_infer/ops/mini_infer_softmax.h"
 
 namespace mini_infer {
 namespace {
@@ -41,8 +43,14 @@ TransformerBlock::TransformerBlock(const TransformerWeights& weights, const Mode
 void TransformerBlock::forward(Tensor& hidden, KVCache& cache, int32_t layer_idx,
                                 int32_t position, TransformerWorkspace& work,
                                 cudaStream_t stream) {
-    // 1. 先归一化。hidden 仍保留原值，稍后的残差连接还需要它。
-    norm_.set_input(0, hidden);
+    forward(hidden, hidden, cache, layer_idx, position, work, stream);
+}
+
+void TransformerBlock::forward(const Tensor& input, Tensor& output, KVCache& cache,
+                                int32_t layer_idx, int32_t position,
+                                TransformerWorkspace& work, cudaStream_t stream) {
+    // 1. 先归一化。input 仍保留原值，稍后的残差连接还需要它。
+    norm_.set_input(0, input);
     norm_.set_output(0, work.normalized);
     norm_.forward(stream);
 
@@ -58,9 +66,30 @@ void TransformerBlock::forward(Tensor& hidden, KVCache& cache, int32_t layer_idx
     output_.set_input(0, work.attended);
     output_.set_output(0, work.projected);
     output_.forward(stream);
-    add_.forward(hidden, work.projected, work.residual, stream);
+    add_.forward(input, work.projected, work.residual, stream);
 
-    // 4. MLP 包含第二次 RMSNorm 和第二条残差，最终写回 hidden。
-    mlp_.forward(work.residual, hidden, work.mlp, stream);
+    // 4. MLP 包含第二次 RMSNorm 和第二条残差，最终写入独立或原位 output。
+    mlp_.forward(work.residual, output, work.mlp, stream);
 }
 }  // namespace mini_infer
+namespace mini_infer {
+void TransformerBlock::forward_paged(const Tensor& input,Tensor& output,Tensor& key,Tensor& value,
+    const float* const* pages,std::size_t tokens_per_page,int32_t position,
+    TransformerWorkspace& work,cudaStream_t stream) {
+    norm_.set_input(0,input);norm_.set_output(0,work.normalized);norm_.forward(stream);
+    qkv_.forward_into(work.normalized,work.query,key,value,stream);
+    rope_inplace(work.query,key,head_dim_,position,10000.0f,stream);
+    const auto heads=work.query.dim(0)/head_dim_,kv_heads=key.dim(0)/head_dim_;
+    // Same dot grouping, same CUB softmax, same serial AV accumulation as the
+    // contiguous path. Only physical K/V addressing changes.
+    infer::paged_attention_qk_f32(work.query.ptr<float>(),pages,work.scores.ptr<float>(),
+        position+1,tokens_per_page,heads,kv_heads,head_dim_,work.scores.dim(1),stream);
+    detail::softmax_rows_cuda(work.scores.ptr<float>(),work.scores.ptr<float>(),heads,
+        position+1,work.scores.dim(1),stream);
+    infer::paged_attention_av_f32(work.scores.ptr<float>(),pages,work.attended.ptr<float>(),
+        position+1,tokens_per_page,heads,kv_heads,head_dim_,work.scores.dim(1),stream);
+    output_.set_input(0,work.attended);output_.set_output(0,work.projected);output_.forward(stream);
+    add_.forward(input,work.projected,work.residual,stream);
+    mlp_.forward(work.residual,output,work.mlp,stream);
+}
+}

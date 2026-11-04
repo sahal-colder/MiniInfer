@@ -15,8 +15,15 @@ namespace infer {
 // 后端分配句柄仅定位某次物理分配。迁移会换句柄，逻辑 BlockId 保持不变。
 using StorageHandle = std::uint64_t;
 enum class HostMemoryKind { PAGEABLE, PINNED };
-// 两种模式都在消费时校验身份和 CRC；READ_BACK 另在发布前完整回读。
-enum class SSDVerification { READ_BACK, ON_READ };
+// NONE checks identity only; ON_READ checks CRC on consumption; READ_BACK
+// additionally verifies publication. Release defaults to raw payload I/O.
+enum class SSDVerification { READ_BACK, ON_READ, NONE, kNone = NONE };
+using VerifyPolicy = SSDVerification;
+#ifdef NDEBUG
+inline constexpr auto default_ssd_verification = VerifyPolicy::kNone;
+#else
+inline constexpr auto default_ssd_verification = SSDVerification::READ_BACK;
+#endif
 struct StorageMemoryView {
     void* data = nullptr;
     std::size_t capacity = 0;
@@ -164,15 +171,20 @@ class SSDStorageBackend final : public StorageBackend {
     static std::size_t allocation_size(std::size_t slot_bytes, std::size_t alignment);
     SSDStorageBackend(std::size_t slot_bytes, std::size_t max_reserved_bytes,
                       const std::string& directory = "/tmp", FileIOConfig io = {},
-                      SSDVerification verification = SSDVerification::READ_BACK);
+                      SSDVerification verification = default_ssd_verification);
     SSDStorageBackend(std::size_t slot_bytes, std::size_t max_reserved_bytes,
                       std::unique_ptr<SSDDevice> device,
-                      SSDVerification verification = SSDVerification::READ_BACK,
+                      SSDVerification verification = default_ssd_verification,
                       std::size_t read_piece_bytes = 0);
     ~SSDStorageBackend() override;
     StorageLocation location() const noexcept override { return StorageLocation::SSD; }
     std::size_t slot_bytes() const noexcept override;
     std::size_t allocation_bytes() const noexcept override;
+    // Byte offset within each record; device-aligned slots use a full metadata
+    // sector, while files and compact device records retain their 64-byte prefix.
+    std::size_t payload_offset() const noexcept;
+    // Empty for files; owning devices charge DMA leases to their own budget.
+    std::shared_ptr<SSDDmaBuffer> allocate_dma_buffer(std::size_t bytes);
     StorageHandle reserve() override;
     void release(StorageHandle handle) override;
     StorageMemoryView memory_view(StorageHandle handle) const override; // data 始终为空。
@@ -190,6 +202,8 @@ class SSDStorageBackend final : public StorageBackend {
     BackendPoolStats pool_stats() const override;
     BackendIOStats io_stats() const override;
     void read_validated_many(const std::vector<StorageRead>& requests) override;
+    // Callers with their own parallel request workers can avoid nested fan-out.
+    void read_validated_many(const std::vector<StorageRead>& requests, bool split_singleton);
 
   private:
     struct Impl;

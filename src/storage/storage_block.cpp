@@ -81,6 +81,18 @@ void BlockLease::finish() {
     record_->backend->wait(stream_); // 失败仍保留 Lease，调用者可以重试。
     detach(true, true);
 }
+void BlockLease::finish_group(const std::vector<BlockLease*>& leases) {
+    BlockLease* first=nullptr;
+    for (auto* lease:leases) if (lease->record_) {
+        if (!first) first=lease;
+        if (lease->state_.get()!=first->state_.get() || lease->record_->backend!=first->record_->backend ||
+            lease->stream_!=first->stream_)
+            throw std::invalid_argument("Lease group must share storage, backend and consumer stream");
+    }
+    if (!first) return;
+    first->record_->backend->wait(first->stream_);
+    for (auto* lease:leases) if (lease->record_) lease->detach(true,true);
+}
 void BlockLease::reset() noexcept {
     if (!record_)
         return;

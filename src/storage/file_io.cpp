@@ -59,8 +59,53 @@ void validate(const std::vector<FileIORequest>& requests, bool write) {
         }
     }
 }
+void read_adjacent(int fd, const std::vector<FileIORequest>& requests, std::size_t first,
+                   std::size_t end) {
+    std::array<iovec, 128> parts;
+    std::size_t done = 0;
+    while (first < end) {
+        std::size_t left = INT_MAX;
+        int count = 0;
+        for (auto i = first; i < end && left; ++i) {
+            const auto skip = i == first ? done : 0;
+            const auto bytes = std::min(requests[i].bytes - skip, left);
+            parts[count++] = {static_cast<char*>(requests[i].data) + skip, bytes};
+            left -= bytes;
+        }
+        const auto n = ::preadv(fd, parts.data(), count, requests[first].offset + done);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            throw std::system_error(errno, std::generic_category(), "FileIO POSIX");
+        }
+        if (!n)
+            throw std::runtime_error("FileIO unexpected EOF");
+        auto remaining = std::size_t(n);
+        while (remaining) {
+            const auto bytes = std::min(remaining, requests[first].bytes - done);
+            remaining -= bytes;
+            done += bytes;
+            if (done == requests[first].bytes) {
+                ++first;
+                done = 0;
+            }
+        }
+    }
+}
 void posix_io(int fd, const std::vector<FileIORequest>& requests, bool write) {
-    for (const auto& r : requests) {
+    for (std::size_t first = 0; first < requests.size(); ++first) {
+        if (!write) {
+            auto end = first + 1;
+            while (end < requests.size() &&
+                   requests[end - 1].offset + requests[end - 1].bytes == requests[end].offset)
+                ++end;
+            if (end > first + 1) {
+                read_adjacent(fd, requests, first, end);
+                first = end - 1;
+                continue;
+            }
+        }
+        const auto& r = requests[first];
         std::size_t done = 0;
         const auto total = transfer_bytes(r);
         while (done < total) {

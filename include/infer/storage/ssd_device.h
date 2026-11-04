@@ -12,6 +12,17 @@ struct SSDDeviceStats {
     // Entire process-owned EAL heap, including DMA, mempools and unused space.
     std::size_t environment_bytes = 0;
     std::uint64_t read_bytes = 0, written_bytes = 0, completed_ios = 0;
+    std::uint64_t copied_read_bytes = 0, copied_write_bytes = 0;
+    std::uint64_t direct_read_bytes = 0, direct_written_bytes = 0;
+};
+
+// A device-owned DMA allocation. Its owner keeps the SPDK environment alive;
+// CUDA registrations must be removed before releasing the final reference.
+class SSDDmaBuffer {
+  public:
+    virtual ~SSDDmaBuffer() = default;
+    virtual void* data() const noexcept = 0;
+    virtual std::size_t size() const noexcept = 0;
 };
 
 // Byte-range adapter below the SSD record/CRC layer. Calls finish all accepted
@@ -33,6 +44,10 @@ class SSDDevice {
         }
     }
     virtual SSDDeviceStats stats() const = 0;
+    virtual FileIOStats file_io_stats() const { return {}; }
+    // Filesystem devices return empty. SPDK page-rounds and charges live leases
+    // plus its fixed bounce slots to dma_budget_bytes; exhaustion throws.
+    virtual std::shared_ptr<SSDDmaBuffer> allocate_dma_buffer(std::size_t) { return {}; }
 };
 
 struct SpdkBdevConfig {
@@ -44,16 +59,20 @@ struct SpdkBdevConfig {
     std::size_t io_buffer_bytes = 256 * 1024;
     std::size_t dma_budget_bytes = 2 * 1024 * 1024;
     int environment_mib = 256; // Includes DMA buffers; separate from CPU KV budget.
-    bool no_huge = true;       // File/malloc testing. Direct PCI NVMe needs hugepages.
-    bool no_pci = true;
+    bool no_huge = false;      // Dedicated PCI NVMe; file/malloc tests opt out explicitly.
+    bool no_pci = false;
+    std::string iova_mode = "auto"; // va: unprivileged VFIO/IOMMU; pa: physical addresses.
 };
 
 bool spdk_available() noexcept;
 // EAL retains its reusable arena until process exit, including after a backend
 // closes. Report that process resource independently of live logical blocks.
 std::size_t spdk_environment_bytes() noexcept;
-// One owning SPDK app per process. Only its reactor accesses bdev/channel APIs;
-// callers use a bounded submission queue and retain their buffers until completion.
+// One SPDK app lifecycle per process. Leases keep its reactor alive after the
+// device closes; after the final lease/device closes, reopening needs a new
+// process (EAL reinitialization cannot migrate its original main-thread TLS).
+// Only the reactor accesses bdev/channel APIs; callers retain I/O buffers until
+// completion and share its bounded submission slots.
 std::unique_ptr<SSDDevice> open_spdk_device(const SpdkBdevConfig& config);
 
 } // namespace infer

@@ -36,7 +36,8 @@ def ssd_payload_capacity(total, payload, compact=False, alignment=1):
     return slots * payload
 
 
-def host_cache_budget(total, payload, buffer_slots, pooled, compact=False, device_reserved=0):
+def host_cache_budget(total, payload, buffer_slots, pooled, compact=False, device_reserved=0,
+                      staging_in_device=False):
     if type(device_reserved) is not int or device_reserved < 0:
         raise ValueError("Invalid SSD device reservation")
     if any(type(n) is not int or n <= 0 for n in (total, payload, buffer_slots)):
@@ -44,7 +45,12 @@ def host_cache_budget(total, payload, buffer_slots, pooled, compact=False, devic
     if buffer_slots < 2 or buffer_slots % 2:
         raise ValueError("Staging requires an even number of slots >= 2")
     buffer = payload * buffer_slots
-    if pooled:
+    if staging_in_device:
+        # Device leases are page-rounded inside the already charged EAL arena.
+        if not device_reserved or 2 * ((buffer + 4095) // 4096 * 4096) >= device_reserved:
+            raise ValueError("SSD device arena cannot hold staging and I/O buffers")
+        buffer = 0
+    elif pooled:
         buffer = pool_allocation_bytes(buffer)
     else:
         # Torch's caching host allocator rounds to powers of two by default.

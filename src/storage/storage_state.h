@@ -36,9 +36,10 @@ struct ConsumerUse {
 
 // 两槽生命周期属于 StorageState；busy 的槽不能重写或释放。
 struct TransferSlots {
-    explicit TransferSlots(std::size_t bytes);
+    explicit TransferSlots(std::size_t bytes, SSDStorageBackend* device = nullptr);
     ~TransferSlots();
     std::unique_ptr<CachingPinnedHostAllocator> pool;
+    std::unique_ptr<std::array<std::shared_ptr<SSDDmaBuffer>, 2>> dma;
     std::array<void*, 2> data{};
     std::array<bool, 2> busy{};
     std::size_t bytes = 0;

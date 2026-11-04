@@ -36,7 +36,8 @@ LogicalBlockRecord* prepare_locked(StorageState& state, BlockId id, StorageLocat
     if (uses_gpu) {
         if (!batch && !op->direct_host) {
             if (!state.staging)
-                state.staging = std::make_unique<TransferSlots>(state.block_bytes);
+                state.staging = std::make_unique<TransferSlots>(state.block_bytes,
+                    dynamic_cast<SSDStorageBackend*>(state.ssd_tier.backend.get()));
             staging = 0;
             while (staging < 2 && state.staging->busy[staging])
                 ++staging;
@@ -108,7 +109,8 @@ std::vector<LogicalBlockRecord*> prepare_batch(StorageState& state, const std::v
         staging = 2;
         if (uses_gpu) {
             if (!state.staging)
-                state.staging = std::make_unique<TransferSlots>(state.block_bytes);
+                state.staging = std::make_unique<TransferSlots>(state.block_bytes,
+                    dynamic_cast<SSDStorageBackend*>(state.ssd_tier.backend.get()));
             staging = 0;
             while (staging < 2 && state.staging->busy[staging])
                 ++staging;
@@ -249,9 +251,43 @@ MigrationResult execute_transfer(StorageState& state, LogicalBlockRecord& record
     return result;
 }
 
-TransferSlots::TransferSlots(std::size_t slot_bytes) : bytes(slot_bytes) {
+TransferSlots::TransferSlots(std::size_t slot_bytes, SSDStorageBackend* device) : bytes(slot_bytes) {
     if (bytes > std::numeric_limits<std::size_t>::max() / 2)
         throw std::overflow_error("Pinned slot capacity overflow");
+#if INFER_ENABLE_CUDA
+    if (device) {
+        try {
+            auto first = device->allocate_dma_buffer(bytes);
+            if (first) {
+                dma = std::make_unique<std::array<std::shared_ptr<SSDDmaBuffer>, 2>>();
+                (*dma)[0] = std::move(first);
+                (*dma)[1] = device->allocate_dma_buffer(bytes);
+                if (!(*dma)[1]) throw std::runtime_error("Incomplete device DMA staging");
+            }
+        } catch (const std::bad_alloc&) {
+            dma.reset(); // Older budgets cover only bounce slots; keep bounded pinned staging.
+        }
+        if (dma) {
+            std::size_t registered = 0;
+            try {
+                for (auto& buffer : *dma) {
+                    check_cuda(cudaHostRegister(buffer->data(), buffer->size(), cudaHostRegisterPortable),
+                               "Register device transfer staging");
+                    data[registered++] = buffer->data();
+                }
+            } catch (...) {
+                bool retained = false;
+                for (std::size_t i = 0; i < registered; ++i)
+                    retained |= cudaHostUnregister(data[i]) != cudaSuccess;
+                if (retained) (void)dma.release();
+                throw;
+            }
+            return;
+        }
+    }
+#else
+    (void)device;
+#endif
     CachingCPUAllocatorConfig config;
     config.max_reuse_waste = 0;
     pool = std::make_unique<CachingPinnedHostAllocator>(config);
@@ -259,10 +295,16 @@ TransferSlots::TransferSlots(std::size_t slot_bytes) : bytes(slot_bytes) {
         ptr = pool->allocate(bytes);
 }
 TransferSlots::~TransferSlots() {
+#if INFER_ENABLE_CUDA
+    if (dma && !quarantined)
+        for (auto* ptr : data)
+            quarantined |= cudaHostUnregister(ptr) != cudaSuccess;
+#endif
     if (quarantined) {
         // 设备故障使 DMA 完成未知；池及其内存一起保留到进程退出。
         std::fputs("Storage pinned slots quarantined until process exit\n", stderr);
         (void)pool.release();
+        (void)dma.release(); // Keep device leases alive when CUDA completion is unknown.
     }
 }
 

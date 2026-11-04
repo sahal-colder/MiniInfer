@@ -19,6 +19,8 @@ std::size_t multiply(std::size_t a, std::size_t b) {
 
 ModelWeights load_model_weights(const std::string& path,
                                 std::shared_ptr<DeviceAllocator> allocator) {
+    if (path.size()>=12 && path.compare(path.size()-12,12,".safetensors")==0)
+        return load_safetensors_weights(path,std::move(allocator));
     if (!allocator || (allocator->device_type() != DeviceType::CPU &&
                        allocator->device_type() != DeviceType::CUDA))
         throw std::invalid_argument("model loader needs a CPU or CUDA allocator");
@@ -62,6 +64,7 @@ ModelWeights load_model_weights(const std::string& path,
     QKVWeightLoader qkv_loader(file);
     MLPWeightLoader mlp_loader(file);
     ModelWeights weights;
+    weights.loading.backend="legacy-mmap";
     weights.config = c;
     weights.config.vocab_size = vocab;
     weights.embedding = read(0, {vocab, c.dim});

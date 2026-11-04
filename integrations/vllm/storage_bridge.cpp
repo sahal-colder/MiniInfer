@@ -1,8 +1,11 @@
 // 实验用 C ABI：vLLM 负责 token 哈希、淘汰和 DMA，项目 SSD 后端负责文件与校验。
 #include "host_io_queue.h"
+#include "native_transfer.h"
+#include "native_staging.h"
 #include "infer/storage/kv_offload_cache.h"
 #include "infer/storage/storage_backend.h"
 #include "infer/storage/tiered_storage.h"
+#include "infer/io/direct_file.h"
 #include <algorithm>
 #include <charconv>
 #include <chrono>
@@ -31,11 +34,13 @@ infer::SSDVerification ssd_verification(infer::SSDVerification fallback) {
     const char* value = std::getenv("MINIINFER_SSD_VERIFY");
     if (!value)
         return fallback;
+    if (std::strcmp(value, "none") == 0)
+        return infer::SSDVerification::NONE;
     if (std::strcmp(value, "read_back") == 0)
         return infer::SSDVerification::READ_BACK;
     if (std::strcmp(value, "on_read") == 0)
         return infer::SSDVerification::ON_READ;
-    throw std::invalid_argument("MINIINFER_SSD_VERIFY must be read_back or on_read");
+    throw std::invalid_argument("MINIINFER_SSD_VERIFY must be none, read_back or on_read");
 }
 infer::FileIOConfig file_io_config() {
     infer::FileIOConfig result;
@@ -43,12 +48,12 @@ infer::FileIOConfig file_io_config() {
     if (const char* value = std::getenv("MINIINFER_FILE_IO")) {
         if (std::strcmp(value, "posix") == 0)
             result.mode = infer::FileIOMode::POSIX;
-        else if (std::strcmp(value, "uring") == 0)
+        else if (std::strcmp(value, "uring") == 0 || std::strcmp(value, "direct") == 0)
             result.mode = infer::FileIOMode::IO_URING;
         else if (std::strcmp(value, "auto") == 0)
             result.mode = infer::FileIOMode::AUTO;
         else
-            throw std::invalid_argument("MINIINFER_FILE_IO must be auto, posix or uring");
+            throw std::invalid_argument("MINIINFER_FILE_IO must be auto, posix, uring or direct");
     }
     result.file_shards = env_number("MINIINFER_FILE_SHARDS", 4);
     result.queue_depth = env_number("MINIINFER_IO_DEPTH", 64);
@@ -65,13 +70,33 @@ void append_file_io_stats(std::ostream& out, const infer::FileIOStats& s) {
         << ",\"uring_read_bytes\":" << s.read_bytes << ",\"uring_written_bytes\":" << s.write_bytes
         << ",\"uring_submissions\":" << s.submissions << ",\"uring_completions\":" << s.completions
         << ",\"uring_peak_inflight\":" << s.peak_inflight
-        << ",\"uring_completion_waits\":" << s.completion_waits << ",\"uring_rings\":" << s.rings;
+        << ",\"uring_completion_waits\":" << s.completion_waits << ",\"uring_rings\":" << s.rings
+        << ",\"uring_setup_flags\":" << s.setup_flags
+        << ",\"uring_registered_buffer_bytes\":" << s.registered_buffer_bytes
+        << ",\"uring_fixed_buffer_operations\":" << s.fixed_buffer_operations
+        << ",\"uring_ordinary_buffer_operations\":" << s.ordinary_buffer_operations
+        << ",\"uring_buffer_registration_failures\":" << s.buffer_registration_failures
+        << ",\"uring_buffer_window_registrations\":" << s.buffer_window_registrations
+        << ",\"uring_hugetlb_pools\":" << s.hugetlb_pools;
+}
+void append_device_stats(std::ostream& out, const infer::SSDDeviceStats& s) {
+    out << ",\"ssd_environment_bytes\":" << s.environment_bytes
+        << ",\"ssd_dma_reserved_bytes\":" << s.dma_reserved_bytes
+        << ",\"ssd_device_read_bytes\":" << s.read_bytes
+        << ",\"ssd_device_written_bytes\":" << s.written_bytes
+        << ",\"ssd_device_completed_ios\":" << s.completed_ios
+        << ",\"ssd_copied_read_bytes\":" << s.copied_read_bytes
+        << ",\"ssd_copied_write_bytes\":" << s.copied_write_bytes
+        << ",\"ssd_direct_read_bytes\":" << s.direct_read_bytes
+        << ",\"ssd_direct_written_bytes\":" << s.direct_written_bytes;
 }
 void configure_spdk(infer::KVOffloadConfig& config) {
     const char* name = std::getenv("MINIINFER_SPDK_BDEV");
     if (!name || !*name)
         return;
     auto& spdk = config.ssd_spdk;
+    if (const char* mode = std::getenv("MINIINFER_SPDK_IOVA_MODE"))
+        spdk.iova_mode = mode;
     spdk.bdev_name = name;
     const char* json = std::getenv("MINIINFER_SPDK_CONFIG");
     if (!json || !*json)
@@ -82,8 +107,8 @@ void configure_spdk(infer::KVOffloadConfig& config) {
     spdk.capacity_bytes = env_number("MINIINFER_SPDK_CAPACITY_BYTES", 0);
     spdk.offset_bytes = env_number("MINIINFER_SPDK_OFFSET_BYTES", 0);
     const auto memory = env_number("MINIINFER_SPDK_MEM_MIB", 256);
-    const auto no_huge = env_number("MINIINFER_SPDK_NO_HUGE", 1),
-               no_pci = env_number("MINIINFER_SPDK_NO_PCI", 1);
+    const auto no_huge = env_number("MINIINFER_SPDK_NO_HUGE", 0),
+               no_pci = env_number("MINIINFER_SPDK_NO_PCI", 0);
     if (memory < 64 || memory > 4096 || no_huge > 1 || no_pci > 1)
         throw std::invalid_argument("Invalid SPDK environment options");
     spdk.environment_mib = static_cast<int>(memory);
@@ -94,7 +119,9 @@ void configure_spdk(infer::KVOffloadConfig& config) {
     if (!kib || kib > 8192)
         throw std::invalid_argument("Invalid SPDK I/O chunk size");
     spdk.io_buffer_bytes = kib * 1024;
-    spdk.dma_budget_bytes = spdk.queue_depth * spdk.io_buffer_bytes;
+    // The entire EAL arena is already charged to the host budget. Bounce slots
+    // and CUDA-visible staging leases share it instead of a second allocation.
+    spdk.dma_budget_bytes = memory * 1024 * 1024;
 }
 struct TieredStore {
     infer::KVOffloadCache cache;
@@ -116,6 +143,8 @@ struct TieredStore {
               config.payload_bytes) {}
     static infer::KVOffloadConfig prepare(infer::KVOffloadConfig config) {
         config.ssd_verification = ssd_verification(config.ssd_verification);
+        if (const auto mode = std::getenv("MINIINFER_FILE_IO"))
+            config.ssd_direct = std::strcmp(mode, "direct") == 0;
         const auto force = env_number("MINIINFER_IO_ASYNC", 0);
         if (force > 1)
             throw std::invalid_argument("MINIINFER_IO_ASYNC must be 0 or 1");
@@ -137,11 +166,10 @@ struct Store {
     HostIOQueue queue;
     Store(std::size_t payload, std::size_t slot_bytes, std::size_t count, const char* directory)
         : bytes(payload),
-          backend(slot_bytes, budget(slot_bytes, count), directory, file_io_config(),
-                  ssd_verification(infer::SSDVerification::READ_BACK)),
+          backend(open_backend(slot_bytes, count, directory)),
           slots(count), queue([this](bool write, const auto& indices,
                                      const auto& buffers) { batch(write, indices, buffers); },
-                              payload) {
+                              payload, payload>=1024*1024 ? 4 : 1) {
         if (!payload || payload > slot_bytes)
             throw std::invalid_argument("Invalid payload size");
     }
@@ -182,10 +210,33 @@ struct Store {
         if (write)
             backend.write_published_many(writes);
         else
-            backend.read_validated_many(reads);
+            // Large requests already run on independent queue workers. Preserve
+            // expected identity/version and CRC checks without nested fan-out.
+            backend.read_validated_many(reads,bytes<1024*1024);
     }
-    static std::size_t budget(std::size_t size, std::size_t count) {
-        const auto record = infer::SSDStorageBackend::allocation_size(size);
+    static infer::SSDStorageBackend open_backend(std::size_t size, std::size_t count,
+                                                const char* directory) {
+        infer::KVOffloadConfig config;
+        config.ssd_io = file_io_config();
+        configure_spdk(config);
+        const auto verification = ssd_verification(infer::default_ssd_verification);
+        if (const auto mode = std::getenv("MINIINFER_FILE_IO"); mode && std::strcmp(mode, "direct") == 0) {
+            if (!config.ssd_spdk.bdev_name.empty())
+                throw std::invalid_argument("Choose direct-file or SPDK, not both");
+            const auto limit = budget(size, count, 4096);
+            return infer::SSDStorageBackend(size, limit,
+                infer::io::open_direct_file_device(directory, limit, config.ssd_io.queue_depth), verification);
+        }
+        if (!config.ssd_spdk.bdev_name.empty()) {
+            auto device = infer::open_spdk_device(config.ssd_spdk);
+            const auto limit = budget(size, count, device->alignment());
+            return infer::SSDStorageBackend(size, limit, std::move(device), verification);
+        }
+        return infer::SSDStorageBackend(size, budget(size, count), directory,
+                                        config.ssd_io, verification);
+    }
+    static std::size_t budget(std::size_t size, std::size_t count, std::size_t alignment = 1) {
+        const auto record = infer::SSDStorageBackend::allocation_size(size, alignment);
         if (!count || count > std::numeric_limits<std::size_t>::max() / record)
             throw std::invalid_argument("Invalid slot capacity");
         return count * record;
@@ -228,6 +279,79 @@ template <class F> int checked(F action) noexcept {
 }
 } // namespace
 extern "C" {
+int mi_transfer_available() { return MINIINFER_NATIVE_TRANSFERS; }
+#if MINIINFER_NATIVE_TRANSFERS
+void* mi_transfer_create(void* pointer, int tiered, std::size_t gpu_blocks,
+                         std::size_t buffer_slots, std::size_t layers,
+                         const CUdeviceptr* gpu_bases, const std::size_t* layer_bytes,
+                         void* store_buffer, void* load_buffer, CUstream store_stream,
+                         CUstream load_stream, std::size_t descriptor_cap, int read_ahead) {
+    NativeTransfer* result = nullptr;
+    checked([&] {
+        require_store(pointer);
+        if ((tiered != 0 && tiered != 1) || (read_ahead != 0 && read_ahead != 1) ||
+            !layers || !gpu_bases || !layer_bytes)
+            throw std::invalid_argument("Invalid native transfer configuration");
+        const std::vector<CUdeviceptr> bases(gpu_bases, gpu_bases + layers);
+        const std::vector<std::size_t> sizes(layer_bytes, layer_bytes + layers);
+        if (tiered) {
+            auto& store = *static_cast<TieredStore*>(pointer);
+            result = new NativeTransfer(
+                [&store](bool write, const auto& slots, const auto& buffers) {
+                    if (write) store.cache.write_many(slots, buffers);
+                    else store.cache.read_many(slots, buffers);
+                }, store.queue, store.bytes, buffer_slots, gpu_blocks, store.capacity,
+                bases, sizes, store_buffer, load_buffer, store_stream, load_stream,
+                descriptor_cap, read_ahead);
+            return;
+        }
+        auto& store = *static_cast<Store*>(pointer);
+        result = new NativeTransfer(
+            [&store](bool write, const auto& slots, const auto& buffers) {
+                store.batch(write, slots, buffers);
+            }, store.queue, store.bytes, buffer_slots, gpu_blocks, store.slots.size(),
+            bases, sizes, store_buffer, load_buffer, store_stream, load_stream,
+            descriptor_cap, read_ahead);
+    });
+    return result;
+}
+int mi_transfer_execute(void* pointer, int write, std::size_t count,
+                        const std::size_t* gpu, const std::size_t* disk,
+                        NativeTransfer::Result* result) {
+    return checked([&] {
+        if (!pointer || !result || (write != 0 && write != 1))
+            throw std::invalid_argument("Invalid native transfer call");
+        *result = {};
+        static_cast<NativeTransfer*>(pointer)->execute(write, gpu, disk, count, *result);
+    });
+}
+void mi_transfer_destroy(void* pointer) { delete static_cast<NativeTransfer*>(pointer); }
+#endif
+void* mi_store_staging_tensor(void* pointer, std::size_t bytes, int device) {
+    void* result = nullptr;
+    checked([&] {
+        auto& store = *static_cast<Store*>(require_store(pointer));
+        auto buffer = store.backend.allocate_dma_buffer(bytes);
+        if (!buffer)
+            throw std::runtime_error("Store does not expose device-owned DMA staging");
+        result = miniinfer_staging::make_tensor(std::move(buffer), bytes, device);
+    });
+    return result;
+}
+void* mi_tiered_staging_tensor(void* pointer, std::size_t bytes, int device) {
+    void* result = nullptr;
+    checked([&] {
+        auto& store = *static_cast<TieredStore*>(require_store(pointer));
+        auto buffer = store.cache.allocate_dma_buffer(bytes);
+        if (!buffer)
+            throw std::runtime_error("Store does not expose device-owned DMA staging");
+        result = miniinfer_staging::make_tensor(std::move(buffer), bytes, device);
+    });
+    return result;
+}
+void mi_store_delete_staging_tensor(void* pointer) {
+    miniinfer_staging::destroy_tensor(static_cast<miniinfer_staging::ManagedTensor*>(pointer));
+}
 int mi_spdk_available() {
     return infer::spdk_available() ? 1 : 0;
 }
@@ -335,6 +459,7 @@ const char* mi_storage_stats(void* ptr) {
             << ",\"io_queue_depth\":" << s.file_io.queue_depth;
         out << ",\"native_queue_peak\":" << static_cast<Store*>(ptr)->queue.peak();
         append_file_io_stats(out, s.file_io);
+        append_device_stats(out, s.device);
         out << '}';
         serialized = out.str();
     });
@@ -473,6 +598,7 @@ const char* mi_tiered_stats(void* ptr) {
             << ",\"ssd_payload_read_bytes\":" << s.ssd_payload_read_bytes
             << ",\"ssd_verification_read_bytes\":" << s.ssd_verification_read_bytes;
         append_file_io_stats(out, s.file_io);
+        append_device_stats(out, s.ssd_device);
         out << '}';
         serialized = out.str();
     });

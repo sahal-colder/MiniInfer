@@ -23,7 +23,9 @@ DEFAULTS = {
     "io-depth": 8, "file-shards": 4, "write-concurrency": 4, "ssd-verify": "on_read",
     "spdk-sdk": "", "spdk-config": "", "spdk-bdev": "",
     "spdk-reactor-mask": "0x1", "spdk-mem-mib": 256,
-    "spdk-no-huge": True, "spdk-no-pci": True, "spdk-chunk-kib": 256,
+    "spdk-iova-mode": "auto",
+    "gpu-cache-bytes": 0, "cufile": False,
+    "spdk-no-huge": False, "spdk-no-pci": False, "spdk-chunk-kib": 256,
 }
 
 
@@ -91,10 +93,12 @@ def validate(config, *, building):
         ("device", ("cpu", "cuda")),
         ("build-type", ("Release", "Debug", "RelWithDebInfo", "MinSizeRel")),
         ("ssd-verify", ("on_read", "read_back")),
+        ("spdk-iova-mode", ("auto", "va", "pa")),
     ):
         if config[key] not in choices:
             raise ValueError(f"{key} must be one of {', '.join(choices)}")
     for key, low, high in (
+        ("gpu-cache-bytes", 0, 2**63 - 1),
         ("jobs", 1, 1024), ("max-tokens", 0, 2**31 - 1),
         ("top-k", 0, 2**31 - 1), ("seed", 0, 2**32 - 1),
         ("max-model-len", 1, 2**31 - 1),
@@ -143,7 +147,8 @@ def build_plan(config):
         "INFER_BUILD_PRELOAD": config["preload"],
         "INFER_MEMORY_MODE": ("sync", "async", "pool").index(config["memory-mode"]),
         "INFER_ENABLE_SPDK": config["storage-engine"] == "spdk",
-        "INFER_ENABLE_IO_URING": config["storage-engine"] in ("uring", "auto"),
+        "INFER_ENABLE_IO_URING": framework == "native" or config["storage-engine"] in ("uring", "auto"),
+        "INFER_ENABLE_CUFILE": config["cufile"],
         "INFER_IO_URING": config["storage-engine"] in ("uring", "auto"),
     }
     flags["INFER_SPDK_ROOT"] = config["spdk-sdk"]
@@ -175,6 +180,14 @@ def run_plan(config):
                           ("steps", "max-tokens"), ("temperature", "temperature"),
                           ("top-k", "top-k"), ("seed", "seed")):
             command.extend([f"--{flag}", str(config[key])])
+        keys = ["storage-engine", "gpu-cache-bytes", "cpu-cache-bytes", "ssd-bytes",
+                "ssd-directory", "io-depth", "file-shards", "ssd-verify"]
+        if config["storage-engine"] == "spdk":
+            keys += [f"spdk-{key}" for key in
+                     ("config", "bdev", "reactor-mask", "mem-mib", "iova-mode", "no-huge", "no-pci", "chunk-kib")]
+        for key in keys:
+            value = int(config[key]) if type(config[key]) is bool else config[key]
+            command.extend([f"--{key}", str(value)])
         return {"framework": "native", "commands": [command]}
     engine = config["storage-engine"]
     environment = {
@@ -187,7 +200,7 @@ def run_plan(config):
         "MINIINFER_SSD_VERIFY": config["ssd-verify"],
     }
     if engine == "spdk":
-        for key in ("config", "bdev", "reactor-mask", "mem-mib", "no-huge", "no-pci", "chunk-kib"):
+        for key in ("config", "bdev", "reactor-mask", "mem-mib", "iova-mode", "no-huge", "no-pci", "chunk-kib"):
             value = config[f"spdk-{key}"]
             if type(value) is bool:
                 value = int(value)
@@ -248,6 +261,8 @@ def run(config, plan):
         command = plan["commands"][0]
         if not Path(command[0]).is_file():
             raise ValueError("Native executable missing; run build first")
+        if config["storage-engine"] != "spdk":
+            Path(config["ssd-directory"]).mkdir(parents=True, exist_ok=True)
         os.execv(command[0], command)
     # Imports and environment changes belong only to the selected vLLM process.
     for key in tuple(os.environ):

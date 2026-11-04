@@ -16,11 +16,12 @@ struct KVOffloadConfig {
     std::size_t cpu_slots = 0;     // 1..logical_slots，预算按取整后的物理槽计费。
     std::string ssd_directory = "/tmp";
     FileIOConfig ssd_io;
+    bool ssd_direct = false;
     std::size_t write_concurrency = 2; // 有界 CPU→SSD worker 数；1 可强制串行对照。
     std::size_t prefetch_depth = 8;    // 排队 + 执行中的预取上限；0 禁用。
     bool retain_ssd_copy = true;       // 预取后再次下放同版本时复用文件副本。
     HostMemoryKind cpu_memory = HostMemoryKind::PAGEABLE;
-    SSDVerification ssd_verification = SSDVerification::READ_BACK;
+    SSDVerification ssd_verification = default_ssd_verification;
     std::uint32_t min_reuse_count = 1;
     bool prompt_only = false;
     bool compact_slots = false;       // 复用 CPU 池细分桶；默认保留原 2 的幂布局。
@@ -72,6 +73,8 @@ struct KVOffloadStats {
     std::size_t protected_cpu_slots = 0;
     std::uint64_t hot_promotions = 0;
     SSDDeviceStats ssd_device;
+    std::uint64_t ssd_copied_read_bytes = 0, ssd_copied_write_bytes = 0;
+    std::uint64_t ssd_direct_read_bytes = 0, ssd_direct_written_bytes = 0;
 };
 
 // GPU 层由调用方持有；本类使用 TieredStorage 管理 CPU/SSD 副本。
@@ -116,6 +119,8 @@ class KVOffloadCache {
     // 拒绝准入时使旧槽失效，返回 false，避免逻辑槽重用后读到旧内容。
     bool write_if_admitted(std::size_t slot, const void* data, KVStoreHint hint);
     KVOffloadStats stats() const;
+    // Device staging shares the SPDK DMA budget; filesystem backends return empty.
+    std::shared_ptr<SSDDmaBuffer> allocate_dma_buffer(std::size_t bytes);
 
   private:
     std::shared_future<bool> submit_prefetch(std::size_t slot, bool allow_eviction);

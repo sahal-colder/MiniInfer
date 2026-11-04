@@ -31,6 +31,14 @@ public:
     void forward(Tensor& hidden, KVCache& cache, int32_t layer_idx,
                  int32_t position, TransformerWorkspace& work,
                  cudaStream_t stream = nullptr);
+    // Separate input/output allows the first block to borrow an embedding row.
+    // Input remains read-only unless the caller explicitly uses in-place output.
+    void forward(const Tensor& input, Tensor& output, KVCache& cache, int32_t layer_idx,
+                 int32_t position, TransformerWorkspace& work,
+                 cudaStream_t stream = nullptr);
+    void forward_paged(const Tensor& input,Tensor& output,Tensor& key,Tensor& value,
+        const float* const* pages,std::size_t tokens_per_page,int32_t position,
+        TransformerWorkspace&,cudaStream_t);
 private:
     int32_t head_dim_;               // 每个 Attention 头对应的特征维度（dim / head_num）
     RMSNormLayer norm_;              // Attention 前的归一化算子

@@ -42,7 +42,7 @@ StorageConfig storage_config(const KVOffloadConfig& config) {
     if (!config.write_concurrency || config.write_concurrency > 16)
         throw std::invalid_argument("Write concurrency must be 1..16");
     const auto slot = KVOffloadCache::allocation_size(config.payload_bytes, config.compact_slots);
-    const auto record = config.ssd_spdk.bdev_name.empty()
+    const auto record = config.ssd_spdk.bdev_name.empty() && !config.ssd_direct
                             ? SSDStorageBackend::allocation_size(slot)
                             : SSDStorageBackend::allocation_size(slot, 4096);
     if (config.cpu_slots > SIZE_MAX / slot || config.logical_slots > SIZE_MAX / record)
@@ -57,6 +57,7 @@ StorageConfig storage_config(const KVOffloadConfig& config) {
     result.budget.ssd_bytes = config.enable_ssd ? config.logical_slots * record : 0;
     result.ssd_directory = config.ssd_directory;
     result.ssd_io = config.ssd_io;
+    result.ssd_direct = config.ssd_direct;
     result.max_async_migrations = config.write_concurrency;
     result.retain_ssd_copy = config.retain_ssd_copy;
     result.cpu_memory = config.cpu_memory;
@@ -993,6 +994,10 @@ KVOffloadStats KVOffloadCache::stats() const {
     result.prefetch_ns = impl_->prefetch_ns.load();
     const auto io = impl_->storage.io_stats(StorageLocation::SSD);
     result.ssd_device = io.device;
+    result.ssd_copied_read_bytes = io.device.copied_read_bytes;
+    result.ssd_copied_write_bytes = io.device.copied_write_bytes;
+    result.ssd_direct_read_bytes = io.device.direct_read_bytes;
+    result.ssd_direct_written_bytes = io.device.direct_written_bytes;
     result.ssd_reserve_ns = io.reserve_ns;
     result.ssd_read_ns = io.read_ns;
     result.ssd_write_ns = io.write_ns;
@@ -1016,4 +1021,10 @@ KVOffloadStats KVOffloadCache::stats() const {
     result.ssd_pending_cleanup_bytes = ssd.pending_cleanup_bytes;
     return result;
 }
+std::shared_ptr<SSDDmaBuffer> KVOffloadCache::allocate_dma_buffer(std::size_t bytes) {
+    auto* backend = dynamic_cast<SSDStorageBackend*>(
+        impl_->storage.state_->tier(StorageLocation::SSD).backend.get());
+    return backend ? backend->allocate_dma_buffer(bytes) : std::shared_ptr<SSDDmaBuffer>{};
+}
+
 } // namespace infer

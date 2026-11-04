@@ -58,9 +58,9 @@ Infer 将这些职责分开：
 | KV Offload | 框架槽绑定、CPU 驻留、SSD 下放、LRU、可选热点保护、预取和副本复用 | 不替代推理框架的请求调度或前缀匹配 |
 | SSD | 定长物理记录槽、有效长度、身份/版本/CRC32C 校验、私有文件分片 | 临时 spill，不是重启恢复或掉电持久化格式 |
 | I/O | POSIX、可选 dlsym / io_uring、可注入字节设备 | 明确请求不可用后端时会返回错误 |
-| SPDK | 可选 SDK 后端与设备合同；官方源码子模块固定提交 | 需要显式构建 SDK；真实 NVMe 直通尚未验证 |
-| Native | 单序列 FP32 Llama、MHA/GQA/MQA、CPU/CUDA、采样和 KV checkpoint | 没有连续批处理或分页 Attention |
-| vLLM | 实验性单 rank connector、批量 DMA、CPU/SSD 分层 | 针对 vLLM 0.31.0、一个 FullAttention KV group 验证 |
+| SPDK | 专用 PCIe NVMe 后端、批量记录写入与设备自有 DMA；官方源码子模块固定提交 | 需要显式构建 SDK、绑定专用盘；已验证本机三星 NVMe 与 CUDA 往返 |
+| Native | 单序列 FP32 Llama、MHA/GQA/MQA、CPU/CUDA、三级 Paged KV、前缀共享和采样 | 没有连续批处理或批量 GEMM prefill |
+| vLLM | 实验性单 rank connector、批量 DMA、CPU/SSD 分层 | 针对 vLLM 0.31.0 / 0.32.0、一个 FullAttention KV group 验证 |
 
 ## 架构与数据模型
 
@@ -113,7 +113,9 @@ flowchart TD
 
 文件记录由 64 字节头和载荷组成，校验身份、版本、长度、头 CRC 和载荷 CRC32C。物理槽布局由后端负责，业务不能依赖 `BlockId × stride` 寻址。
 
-并行批读复用已有 I/O lane，并按约 1 MiB 载荷组织读取/CRC 窗口：小记录继续合批，大记录加入后结束当前窗口。窗口完成后及时校验，再处理后续记录；载荷直接进入最终目标缓冲。当前保留独立的头/载荷读请求，没有新增整块拼接缓冲。
+POSIX 的逐记录读取按 256 KiB 窗口交错执行读取与 CRC，数据直接进入最终目标地址，使校验尽量复用刚读入的 CPU 缓存；大块批次使用已有的并行 worker。io_uring 的并行批读复用已有 I/O lane，并按约 1 MiB 载荷组织读取/CRC 窗口：小记录继续合批，大记录加入后结束当前窗口，完成后及时校验。
+
+存储层分别描述头和载荷，POSIX FileIO 将相邻文件范围合并为有界 `preadv`，直接写入各自目标；不分配整块拼接缓冲。记录身份、版本和 CRC 仍在存储层校验。
 
 ## 环境要求
 
@@ -124,7 +126,7 @@ flowchart TD
 | 独立 C 物理模块 | C11、pthread；关闭逻辑 runtime 后无需 C++ |
 | CUDA / Pinned / Graph | NVIDIA GPU、兼容驱动、CUDA Toolkit；ASYNC/POOL 模式要求 Toolkit 11.2+ |
 | Native 推理 | CUDA Toolkit / nvcc；CPU 运行模式同样需要构建此后端 |
-| vLLM 桥接 | CUDA、所选 Python 环境中的 PyTorch、vLLM **0.31.0** |
+| vLLM 桥接 | CUDA、所选 Python 环境中的 PyTorch、vLLM **0.31.0 或 0.32.0** |
 | io_uring | 可选系统 liburing、允许 io_uring 的 Linux 内核 |
 | SPDK | 可选；固定提交的官方源码子模块或外部 SDK、对应 pkg-config 文件和设备配置 |
 
@@ -185,7 +187,9 @@ python3 app/infer.py run --framework vllm --storage-engine uring \
 
 配置只在构建、启动阶段读取，不进入分配、I/O 或推理热路径。改变框架、CUDA 能力、内存模式或增加后端后先重新执行 `build`；启动时会核对已有构建配置，显式后端不可用会报错。vLLM 入口会用配置中的值组装现有 connector，不再受继承的 `MINIINFER_*` 环境变量影响；直接使用原 connector 的环境变量接口仍保留。
 
-配置中已标注 vLLM 专属字段：自动 CPU/SSD offload、DMA 窗口和模型执行预算。Native CLI 的 KV checkpoint 仍通过显式 `KVCacheStorage` API 使用；该 CLI 不会因设置存储预算而自动 offload。`memory-mode` 选择 MiniInfer 自身 CUDA 分配器的实现，不改写 vLLM/PyTorch 的 GPU 分配器。
+`storage-engine`、SSD 配置和 CPU/SSD 预算同时传入 Native 分页 KV 与 vLLM 接入。Native 的 `gpu-cache-bytes` 为 0 时按模型几何自动计算 GPU KV 预算；直接使用 C++ 时仍由 `ModelOptions::paged` 配置。DMA 窗口和 vLLM 模型执行预算保持 vLLM 专属。显式 KV checkpoint 继续通过 `KVCacheStorage` API 使用。`memory-mode` 选择 MiniInfer 自身 CUDA 分配器的实现。
+
+Native 使用 SPDK 时，配置经 CLI 传入 `LlamaModel` 和分页缓存，实际设备 I/O 计数在退出时报告。GPU/SSD 换页优先复用 SPDK 自有、CUDA 注册的两个主机 DMA 槽，省去一层载荷拷贝；旧 DMA 预算不足时保留原有有界缓冲路径。该路径仍使用主机内存。真正 GPUDirect Storage 依赖 GPU、驱动及文件系统支持；本机 RTX 4060 Laptop 的 `gdscheck` 报告 `GDR=unsupported`，不具备已验证的 GDS P2P 路径。`cufile yes` 仅启用已有可选权重后端，Native 权重加载的 io_uring 路径独立于 KV 使用的 SPDK 后端。
 
 统一配置的 `ssd-bytes` 是物理记录预算。connector 在模型 KV 布局确定后扣除每槽的容量取整、64 字节头部及设备对齐，再计算逻辑槽数；SPDK 区域不会被载荷预算超配。Pinned DMA 窗口与操作系统文件页缓存不包含在这个 SSD 数字中。直接使用旧 connector 的 `disk_capacity_bytes` 载荷合同保持不变；新的物理预算通过 `miniinfer_ssd_bytes` 明确传入。
 
@@ -301,7 +305,7 @@ add_executable(storage_example main.cpp)
 target_link_libraries(storage_example PRIVATE Infer::storage)
 ```
 
-配置外部项目时传入 `-DCMAKE_PREFIX_PATH=/absolute/path/to/install-cpu`。公开目标包括 `Infer::memory`、`Infer::storage`；启用 Native 时还提供 `Infer::native`。兼容的 `MiniInfer::*` 目标继续保留。
+配置外部项目时传入 `-DCMAKE_PREFIX_PATH=/absolute/path/to/install-cpu`。公开目标包括 `Infer::memory`、`Infer::io`、`Infer::storage`；启用 Native 时，`Infer::native_compute` 提供模型、算子和生成能力，链接物理内存、文件 I/O 与分页 KV 所需的逻辑存储核心；`Infer::native` 保留包含 checkpoint 存储适配和 CLI 支持的聚合入口。兼容的 `MiniInfer::*` 目标继续保留。
 
 ## C ABI 与可替换设备
 
@@ -338,7 +342,7 @@ C 头安装在 `include/miniinfer/infer/`，避免与 C++ 的 `infer/infer.h` �
 
 ## 原生推理
 
-Native 后端包含 Tensor、连续 KV Cache、权重加载、Attention/QKV、MLP、RoPE、Embedding、Softmax、GEMV、Tokenizer、Sampler 和 CLI。
+Native 后端包含 Tensor、CUDA 三级 Paged KV / CPU 连续 KV Cache、权重加载、Attention/QKV、MLP、RoPE、Embedding、Softmax、GEMV、Tokenizer、Sampler 和 CLI。
 
 ```bash
 cmake -S . -B build-native -G Ninja \
@@ -366,9 +370,13 @@ cmake --build build-native --parallel 6
 
 切换 `--device cuda` 使用 GPU。支持 greedy、temperature、top-k 采样；全部参数以 `--help` 为准。
 
-**当前 Native 模型格式：** `llama2.c` legacy FP32 checkpoint（28 字节头）与匹配的 `tokenizer.bin`。不直接读取 GGUF、safetensors 或完整量化 checkpoint；独立 INT8 分组 GEMV 算子不等于完整 INT8 模型支持。
+**当前 Native 模型格式：** `llama2.c` legacy FP32 checkpoint（28 字节头）与匹配的 `tokenizer.bin`。CUDA 路径额外支持带 MiniInfer 配置元数据的具名 FP32 `.safetensors`：通过 io_uring＋O_DIRECT＋固定双槽 Pinned 缓冲加载，SDK 可选 cuFile。格式和完整核心实现见 本机开发文档 `docs/storage-memory-subsystem.md`（不随产品源码发布）。不直接读取 GGUF、任意 Hugging Face 模型或完整量化 checkpoint；独立 INT8 分组 GEMV 算子不等于完整 INT8 模型支持。
+
+CUDA `LlamaModel` 默认使用不连续分页 Attention、完整页前缀共享与按层预取；CPU 保留连续 KV。通过 `ModelOptions` 可设置三级预算或显式选择旧连续路径。接入与独立端到端 Benchmark 见 本机开发文档 `docs/paged-model-integration.md`（不随产品源码发布）。
 
 一个 `LlamaModel` 维护一条序列，不能并发调用。`prefill(tokens)` 和 `forward(token)` 推进同一 KV 状态；prefill 当前仍逐 token 执行 decoder，没有批量 GEMM prefill 或多请求调度。
+
+模型在主机一次校验整批 token 后，首层直接借用对应的只读 embedding 权重行，结果写入独立工作区；不上传 token 再读回校验，也不复制 embedding 行。最终 logits 仍同步回传 CPU，供现有采样接口使用。独立的 Embedding 算子保留其原有输入验证合同。
 
 ### 共享池与 KV checkpoint
 
@@ -378,7 +386,7 @@ Checkpoint 按最多 256-token 等量的页组织，尾页仅保存有效字节�
 
 ## vLLM 接入
 
-此集成为实验性单 rank 接入，明确检查 vLLM 0.31.0；升级 vLLM 后需要重新验证其内部接口和布局。模型、请求调度、前缀匹配仍由 vLLM 提供。
+此集成为实验性单 rank 接入，支持 vLLM 0.31.0 与 0.32.0；其他版本需要重新验证其内部接口和布局。模型、请求调度、前缀匹配仍由 vLLM 提供。
 
 先准备兼容的 PyTorch / CUDA Python 环境，再安装对应版本并编译桥接库：
 
@@ -441,10 +449,10 @@ print(outputs[0].outputs[0].text)
 
 | 环境变量 | 可选值 / 作用 |
 |---|---|
-| `MINIINFER_FILE_IO` | `posix` / `uring` / `auto` |
+| `MINIINFER_FILE_IO` | `posix` / `uring` / `auto` / `direct`（固定缓冲 io_uring + O_DIRECT） |
 | `MINIINFER_IO_DEPTH` | 1–64，ring 的配置上限 |
 | `MINIINFER_FILE_SHARDS` | 1 或 4 个私有文件分片 |
-| `MINIINFER_SSD_VERIFY` | `read_back` / `on_read`；均保留消费校验 |
+| `MINIINFER_SSD_VERIFY` | `none` / `read_back` / `on_read`；Release 默认 `none`，另两种模式保留 CRC |
 | `MINIINFER_WRITE_CONCURRENCY` | 有界 CPU→SSD 下放并发 |
 | `MINIINFER_COMPACT_SLOTS` | `1` 使用更细的物理容量取整 |
 | `MINIINFER_CPU_HOT` | `1` 启用可选 CPU 热块保护 |
@@ -452,7 +460,9 @@ print(outputs[0].outputs[0].text)
 
 显式 `uring` 使用真实 io_uring；`auto` 优先尝试可用 ring，不能理解成根据运行负载自动选择最快实现。当前文件 connector 要求 buffered I/O；不将原生 vLLM 的 O_DIRECT 结果和 buffered 结果混为相同缓存条件。
 
-两个 Pinned 半区分别等待自己的 DMA 完成后才可复用。后台文件任务的终结与 GPU Event 的完成是不同条件；关停时需要排空两者。
+MiniInfer 后端独立管理读写队列和缓冲生命周期，通过 `launch_copy` / 完成事件接入 vLLM，复用其 DMA 原语；不继承上游磁盘后端的文件和缓冲状态。文件布局、校验与预算继续由共享存储核心管理。
+
+两个 Pinned 半区分别保留跨请求的 DMA 事件，覆盖缓冲前等待对应事件。正常加载在提交 DMA 后发布完成事件，消费者等待该事件后才可使用 GPU 数据；不在发布前重复同步整个 stream。首批读取和单窗口写入在现有后台线程直接执行，后续预读及多窗口写入仍通过原生队列重叠执行。失败、抢占、显式 drain 和关停继续排空文件任务与 GPU 工作。
 
 ## 异步与所有权约定
 
@@ -476,6 +486,7 @@ print(outputs[0].outputs[0].text)
 | `INFER_MEMORY_MODE` | 2 | 0 同步、1 CUDA async、2 缓存池 |
 | `INFER_ENABLE_IO_URING` | ON，依赖可选 | C++ 文件 I/O |
 | `INFER_ENABLE_SPDK` | OFF | 启用 SPDK SDK 后端 |
+| `INFER_SPDK_URING` | OFF | 额外链接 SPDK uring bdev，仅用于显式选择该 bdev；原生 NVMe 不需要 |
 | `INFER_SPDK_ROOT` | 空 | SPDK 源码构建树或已安装 SDK 前缀 |
 | `INFER_BUILD_RUNTIME` | ON | 共享 C++ 逻辑存储核心 |
 | `INFER_BUILD_C_API` | ON | C ABI 与独立 C 物理模块 |
@@ -489,13 +500,15 @@ print(outputs[0].outputs[0].text)
 
 SPDK 官方源码通过 [`third_party/spdk`](third_party/spdk) 子模块固定到 `v26.09` 的提交 `0bbb7fe4dccfb31e8d446da8822360704949d1e9`，许可证随上游源码保留。普通 CPU、CUDA、C ABI 构建不要求初始化 SPDK，CMake 也不会隐式下载或编译它。
 
-需要 SPDK 时，先初始化源码及所需依赖，按照[固定版本的官方构建说明](https://github.com/spdk/spdk/blob/0bbb7fe4dccfb31e8d446da8822360704949d1e9/README.md#prerequisites)安装系统依赖（包含 liburing 2.3+），再显式构建 SDK：
+SPDK 的部署目标是在 Linux 上独占一块专用 NVMe。原生 NVMe bdev 通过用户态驱动访问 PCIe 控制器，不经过 io_uring；SPDK uring bdev 则走内核 I/O，是另一条可选路径。独立的 `storage-engine uring` 不要求 SPDK。三者按实际 KV 负载比较，不因组合了更多组件就默认更快。
+
+需要 SPDK 时，先初始化源码及所需依赖，按照[固定版本的官方构建说明](https://github.com/spdk/spdk/blob/0bbb7fe4dccfb31e8d446da8822360704949d1e9/README.md#prerequisites)安装系统依赖，再显式构建 SDK。原生 NVMe 不要求 liburing：
 
 ```bash
 git submodule update --init third_party/spdk
 git -C third_party/spdk submodule update --init dpdk isa-l isa-l-crypto
 cd third_party/spdk
-./configure --with-uring --disable-tests --disable-unit-tests \
+./configure --without-uring --disable-tests --disable-unit-tests \
   --disable-examples --disable-apps
 make -j"$(nproc)"
 cd ../..
@@ -509,6 +522,49 @@ cmake --build build-spdk -j"$(nproc)"
 ```
 
 也可将 `INFER_SPDK_ROOT` 指向外部 SDK，或通过 `PKG_CONFIG_PATH` 提供已安装的 SDK。接口见 [`ssd_device.h`](include/infer/storage/ssd_device.h)。选择 bdev、JSON 配置、PCI 绑定及 hugepage 配置由部署方明确指定；构建不会接管系统设备。源码目录、编译生成的 SDK 与真正可用的 NVMe 设备是三个不同条件。
+
+### 专用 NVMe 配置
+
+将目标控制器的 PCI 地址填入下列 JSON（`0000:01:00.0` 仅为占位示例），保存为 `nvme.json`。在 Linux 上按 SPDK 部署要求为该控制器准备 VFIO/IOMMU 和 hugepages；同一个控制器不能同时由 SPDK 和内核 NVMe 驱动拥有。明确选择空闲的专用盘，绑定粒度是控制器，包含其所有 namespace。
+
+```json
+{
+  "subsystems": [
+    {"subsystem": "iobuf", "config": [
+      {"method": "iobuf_set_options", "params": {"small_pool_count": 512, "large_pool_count": 64}}
+    ]},
+    {"subsystem": "bdev", "config": [
+      {"method": "bdev_set_options", "params": {"bdev_io_pool_size": 1024, "bdev_io_cache_size": 64}},
+      {"method": "bdev_nvme_attach_controller", "params": {"name": "MiniInferNvme", "trtype": "PCIe", "traddr": "0000:01:00.0"}}
+    ]}
+  ]
+}
+```
+
+在 `infer.conf` 中配置该 SDK、JSON 和 namespace 的 bdev 名称：
+
+```text
+storage-engine spdk
+spdk-sdk /path/to/spdk
+spdk-config /path/to/nvme.json
+spdk-bdev MiniInferNvmen1
+spdk-no-huge no
+spdk-no-pci no
+spdk-reactor-mask 0x1
+spdk-iova-mode auto
+```
+
+`MiniInferNvmen1` 假定目标为 namespace 1，应按设备实际名称填写。`ssd-bytes` 必须不超过所选 namespace 的可用容量；这片区域是 MiniInfer 临时 KV 存储，会覆盖原内容。reactor 的 CPU mask 应按 NVMe/GPU 的 NUMA 拓扑与模型 CPU 线程分配；示例的核 0 不代表最快选择。`io-depth` 和 `spdk-chunk-kib` 控制并发及 DMA 窗口，应以实机测试确定。PCI 和 hugepages 现为 SPDK 默认设置；malloc/文件测试需显式设置 `spdk-no-huge yes`、`spdk-no-pci yes`。
+
+`spdk-iova-mode` 可选 `auto`、`va`、`pa`，默认保留 SPDK 的自动选择。普通用户通过 VFIO/IOMMU 运行时可显式选择 `va`；该模式使用 64 GiB 的地址起点提示，以适配本机有限宽度的 IOMMU 并避开 CUDA 的低地址映射。VFIO 设备及 hugetlbfs 挂载目录需要授予运行用户访问权限，大页数量和 memlock 必须覆盖 EAL 预算。显式 `spdk-sdk` 优先于继承的 `PKG_CONFIG_PATH`，重新配置已有构建时也会重新解析 SDK。
+
+vLLM 磁盘连接器在 CUDA 12.8+ 的构建中默认使用原生传输执行器：每个请求通过一次 C ABI 调用完成窗口划分、DMA 描述符提交和存储 I/O，仍由连接器发布独立的完成事件。`MINIINFER_NATIVE_TRANSFERS=0` 可选择 Python 路径；开启传输分段计时或关闭 DMA 描述符复用时继续使用该路径。旧 bridge 不提供原生执行器时自动保持原有行为。
+
+显式配置 SPDK 后，普通磁盘和 CPU/SSD 分层连接器均使用设备分配、CUDA 注册的 staging 缓冲区。缓冲区与 I/O bounce 槽共享 `spdk-mem-mib` 的固定 EAL 内存预算；配置总 host 预算时只计入一次 EAL，CPU KV 使用剩余额度。EAL 还包含 bdev/mempool，过小的预算会明确失败。只对设备拥有且对齐的范围执行直接 DMA，普通或非对齐指针保留 bounce/RMW。`ssd_direct_*`、`ssd_copied_*` 和 `ssd_dma_reserved_bytes` 统计实际数据路径及存活分配。
+
+设备对齐的记录使用版本 2：把原先已计费的尾部填充移至 64 字节头部之后，使 payload 对齐到设备边界，不增加槽位容量。文件和紧凑设备记录保持版本 1；两者均保留身份、长度、版本和 CRC 校验。该缓存仍无重启恢复合同。Tensor 别名持有底层 DMA 分配，最后一个别名等待 CUDA 消费完成后才解除注册并释放。当前固定版本的 SPDK/DPDK 每进程支持一次完整 app 生命周期；全部设备和别名关闭后，重新创建 SPDK store 需要新进程，以避免 EAL 主线程绑定失效。
+
+如需比较 SPDK uring bdev，单独用 `--with-uring` 构建 SDK（要求 liburing 2.3+），配置 MiniInfer 时显式加 `-DINFER_SPDK_URING=ON`，并在 JSON 中创建对应 bdev。这不改变 `storage-engine uring` 的独立实现。最终选型要在同一物理 NVMe 上顺序测试，固定数据量、CRC/完成语义、CPU/内存预算和缓存条件，覆盖稳态读写及混合负载、P50/P99 和实际推理 TTFT/TPOT/吞吐。当前独立文件路径使用 buffered I/O；裸盘/O_DIRECT 对照仍需接入验证。WSL、malloc bdev 或热页缓存的结果不能决定物理 NVMe 的胜者。
 
 ## 性能与验证状态
 
@@ -527,7 +583,9 @@ DONTNEED 不能驱逐 Windows/VHD/设备缓存，因此第二行不代表物理�
 
 开发工作区最终回归记录：CUDA 核心 26/26、C ABI CUDA 11/11、CPU 核心 ASan/UBSan 10/10；vLLM 全套 114 项和 4 个 subtest 通过，包含真实模型。Native 存储集成、独立 C 模块等也做过独立验证。上述测试、原始样本和基准工具按本次发布范围保留在本地，不在这个产品源码快照内，不能直接在此快照运行相应套件。
 
-尚未完成的验证包括多 GPU、真实冷设备、SPDK 实机、生产在线 P99 和长期运行。TSan 在本机遇到启动映射错误，没有竞态检测通过结论。Native 与 vLLM 的完整模型兼容范围也不同，不能把一个框架的通过结果推广到另一个。
+2026-11-03 补充完成 Linux / RTX 4060 Laptop / 三星 512GB NVMe 的 SPDK 实机验证：固定版本 SDK、普通用户 VFIO、大页、设备记录校验及 CUDA 多层乱序块往返均通过，载荷统计确认使用设备自有直接 DMA。CUDA 批量传输同时适配 12.8 与 13.x 的接口签名；本轮实际使用 CUDA 13.4 构建和验证。
+
+尚未完成的验证包括多 GPU、整盘冷设备稳态、生产在线 P99 和长期运行。TSan 在先前环境遇到启动映射错误，没有竞态检测通过结论。Native 与 vLLM 的完整模型兼容范围也不同，不能把一个框架的通过结果推广到另一个。
 
 ## 目录与阅读顺序
 
@@ -576,3 +634,9 @@ MiniInfer/
 - CUDA、PyTorch、vLLM、可选 Armadillo、liburing、SPDK 等依赖仍遵循各自许可证。
 
 本仓库尚未声明覆盖全部自有代码的统一根许可证；不要将第三方许可证自动理解为整个项目的许可证。
+
+### Kernel direct-file storage
+
+`MINIINFER_FILE_IO=direct MINIINFER_SSD_VERIFY=none` selects the preallocated filesystem backend without SPDK. It initializes written extents outside measured I/O, uses per-worker registered files, optional fixed buffers and batched CQE harvesting. SQPOLL and filesystem IOPOLL are probed independently with interrupt-mode fallback. The concrete `infer::io::DirectFile` API accepts fixed buffer ranges for direct I/O. It tries to raise the process memlock limit; when registration is unavailable, aligned requests use ordinary READ/WRITE SQEs on the original pointer with a fixed file, with no bounce copies. The owned pool is reserved for unaligned metadata/RMW. Batches keep one SQE per block, while singleton ranges have a configurable stripe size (default 4 MiB). Buffers passed in `DirectFileConfig::buffers` must outlive the device. If the full table cannot fit, declared singleton buffers reuse one fixed window of at most 4 MiB per worker. `uring_buffer_window_registrations` reports window replacements: changing windows still incurs registration/pinning work; a repeated window reuses its binding. Allow headroom beyond payload size for kernel page accounting. Temporary buffers without the declared lifetime continue using ordinary direct I/O. HugeTLB is attempted first; the 2 MiB aligned THP fallback is a hint, not guaranteed physical huge pages.
+
+Each worker owns its ring and pool until device destruction. Account for per-worker locked memory and repeated registrations of borrowed buffers. `uring_setup_flags`, `uring_registered_buffer_bytes`, `uring_hugetlb_pools` and copied/direct byte counters expose the actual mode. No fsync or power-loss durability is implied. Local verification and benchmark limits: local `benchmark-results/2026-11-03-kernel-full-eval/report.md` (excluded from the product-source publication).

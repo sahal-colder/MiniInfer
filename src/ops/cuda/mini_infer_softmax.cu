@@ -2,12 +2,20 @@
 #include "mini_infer/ops/mini_infer_softmax.h"
 
 #include <cub/block/block_reduce.cuh>
+#if CUB_VERSION >= 300000
+#include <cuda/functional>
+#endif
 #include <math_constants.h>  // CUDART_INF_F：归约最大值时使用的负无穷初值。
 #include <algorithm>
 
 namespace mini_infer {
 namespace {
 constexpr unsigned int threads = 128;
+#if CUB_VERSION >= 300000
+using Maximum = cuda::maximum<>;
+#else
+using Maximum = cub::Max;
+#endif
 
 // 一个 block 处理一行。每个线程先做局部 max/sum，再用 CUB 合并。
 // width 可以大于 blockDim.x；尾部线程仍参与归约和全部同步。
@@ -23,7 +31,7 @@ __global__ void softmax_f32(const float* input, float* output, std::size_t rows,
         float local_max = -CUDART_INF_F;
         for (std::size_t i = threadIdx.x; i < std::size_t(width); i += blockDim.x)
             local_max = fmaxf(local_max, x[i]);
-        const float maximum = Reduce(storage).Reduce(local_max, cub::Max());
+        const float maximum = Reduce(storage).Reduce(local_max, Maximum{});
         if (threadIdx.x == 0) row_max = maximum;
         __syncthreads();  // 广播最大值；也保证所有线程读完原始输入。
 

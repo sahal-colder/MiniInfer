@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 struct CUstream_st;
 typedef struct CUstream_st* cudaStream_t;
@@ -36,6 +37,7 @@ struct BlockMeta {
 
 enum class DeviceType;
 class TieredStorage;
+class PagedKV;
 namespace storage_detail {
 struct StorageState;
 struct LogicalBlockRecord;
@@ -70,6 +72,8 @@ class BlockLease {
 
   private:
     friend class TieredStorage;
+    friend class PagedKV;
+    static void finish_group(const std::vector<BlockLease*>&);
     BlockLease(std::shared_ptr<storage_detail::StorageState> state,
                storage_detail::LogicalBlockRecord* record, AccessMode mode, void* data, int device,
                cudaStream_t stream, std::size_t use_index) noexcept;

@@ -71,6 +71,8 @@ public:
         const Tensor& rmsnorm_output, Tensor& query, KVCache& cache,
         int32_t layer_idx, int32_t token_pos, cudaStream_t stream = nullptr);
 
+    // Caller pins disjoint current-page slots on stream through completion.
+    void forward_into(const Tensor&,Tensor& query,Tensor& key,Tensor& value,cudaStream_t);
 private:
     int32_t dim_;
     int32_t kv_dim_;

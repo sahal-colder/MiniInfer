@@ -1,3 +1,4 @@
+#include "infer/io/direct_file.h"
 #include "infer/storage/tiered_storage.h"
 #include "infer/cpu/cpu_memory_pool.h"
 #include "infer/cpu/pinned_memory_pool.h"
@@ -168,7 +169,14 @@ TieredStorage::TieredStorage(StorageConfig config, std::unique_ptr<StorageBacken
         if (config.budget.ssd_bytes < SSDStorageBackend::allocation_size(config.block_bytes))
             throw std::invalid_argument("SSD budget omits record header");
         if (!ssd) {
-            if (config.ssd_spdk.bdev_name.empty())
+            if (config.ssd_direct && !config.ssd_spdk.bdev_name.empty())
+                throw std::invalid_argument("Choose direct-file or SPDK, not both");
+            if (config.ssd_direct)
+                ssd = std::make_unique<SSDStorageBackend>(config.block_bytes, config.budget.ssd_bytes,
+                    io::open_direct_file_device(config.ssd_directory,
+                        config.budget.ssd_bytes / 4096 * 4096, config.ssd_io.queue_depth),
+                    config.ssd_verification);
+            else if (config.ssd_spdk.bdev_name.empty())
                 ssd = std::make_unique<SSDStorageBackend>(
                     config.block_bytes, config.budget.ssd_bytes, config.ssd_directory,
                     config.ssd_io, config.ssd_verification);
