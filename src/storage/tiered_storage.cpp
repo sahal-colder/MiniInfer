@@ -316,17 +316,21 @@ void TieredStorage::read_to_host(BlockId id, void* dst, std::size_t bytes) {
 }
 void TieredStorage::read_to_host_many(const std::vector<BlockId>& ids,
                                       const std::vector<void*>& destinations, std::size_t bytes) {
-    read_to_host_many(ids, destinations, std::vector<std::size_t>(ids.size(), bytes));
+    read_to_host_many_impl(ids, destinations, bytes, nullptr);
 }
 void TieredStorage::read_to_host_many(const std::vector<BlockId> &ids,
                                       const std::vector<void *> &destinations,
                                       const std::vector<std::size_t> &sizes) {
+    read_to_host_many_impl(ids, destinations, 0, &sizes);
+}
+void TieredStorage::read_to_host_many_impl(const std::vector<BlockId>& ids,
+                                           const std::vector<void*>& destinations,
+                                           std::size_t size, const std::vector<std::size_t>* sizes) {
     if (ids.empty() || ids.size() > 64 || ids.size() != destinations.size() ||
-        ids.size() != sizes.size())
+        (sizes && ids.size() != sizes->size()))
         throw std::invalid_argument("Invalid host read batch");
-    std::vector<storage_detail::LogicalBlockRecord*> records;
+    std::array<storage_detail::LogicalBlockRecord*, 64> records{};
     std::vector<StorageRead> cpu, ssd;
-    records.reserve(ids.size());
     cpu.reserve(ids.size());
     ssd.reserve(ids.size());
     std::unique_lock<std::mutex> lock(state_->mutex);
@@ -334,7 +338,7 @@ void TieredStorage::read_to_host_many(const std::vector<BlockId> &ids,
         throw std::overflow_error("Host batch access clock exhausted");
     // 完整预检和请求表分配先于取得使用权，后项参数失败不修改任何源的计数。
     for (std::size_t i = 0; i < ids.size(); ++i) {
-        const auto bytes = sizes[i];
+        const auto bytes = sizes ? (*sizes)[i] : size;
         if (std::find(ids.begin(), ids.begin() + i, ids[i]) != ids.begin() + i)
             throw std::invalid_argument("Duplicate read block");
         auto& record = *state_->logical_blocks.at(ids[i]);
@@ -346,7 +350,7 @@ void TieredStorage::read_to_host_many(const std::vector<BlockId> &ids,
             throw std::invalid_argument("Host batch address overflow");
         for (std::size_t j = 0; j < i; ++j) {
             const auto other = reinterpret_cast<std::uintptr_t>(destinations[j]);
-            if (begin < other + sizes[j] && other < begin + bytes)
+            if (begin < other + (sizes ? (*sizes)[j] : size) && other < begin + bytes)
                 throw std::invalid_argument("Overlapping host batch destinations");
         }
         if ((meta.location != StorageLocation::CPU && meta.location != StorageLocation::SSD) ||
@@ -355,11 +359,11 @@ void TieredStorage::read_to_host_many(const std::vector<BlockId> &ids,
             throw StorageBusy("Host batch source is busy");
         if (meta.lease_count == SIZE_MAX || meta.access_count == SIZE_MAX)
             throw std::overflow_error("Host batch lease overflow");
-        records.push_back(&record);
+        records[i] = &record;
         (meta.location == StorageLocation::CPU ? cpu : ssd)
             .push_back({record.allocation, meta, destinations[i]});
     }
-    HostReadAccess access(*state_, records.data(), records.size());
+    HostReadAccess access(*state_, records.data(), ids.size());
     lock.unlock();
     if (!cpu.empty())
         state_->cpu_tier.backend->read_validated_many(cpu);
@@ -371,21 +375,35 @@ BlockMeta TieredStorage::metadata(BlockId id) const {
     std::lock_guard<std::mutex> lock(state_->mutex);
     return state_->logical_blocks.at(id)->meta;
 }
+const BlockMeta* TieredStorage::bind_metadata(BlockId id) const {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    return &state_->logical_blocks.at(id)->meta;
+}
+BlockMeta TieredStorage::metadata(BlockId id, bool& ssd_copy) const {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    const auto& record = *state_->logical_blocks.at(id);
+    ssd_copy = record.meta.location == StorageLocation::SSD ||
+        (record.ssd_copy.backend && !record.ssd_copy.pending &&
+         record.ssd_copy_version == record.meta.version);
+    return record.meta;
+}
+std::size_t TieredStorage::cpu_allocation_size(std::size_t bytes) const {
+    return state_->cpu_tier.backend->allocation_bytes(bytes);
+}
+std::shared_ptr<SSDDmaBuffer> TieredStorage::allocate_dma_buffer(std::size_t bytes) {
+    auto* backend = dynamic_cast<SSDStorageBackend*>(state_->ssd_tier.backend.get());
+    return backend ? backend->allocate_dma_buffer(bytes) : std::shared_ptr<SSDDmaBuffer>{};
+}
 StorageUsage TieredStorage::stats(StorageLocation location) const {
     std::lock_guard<std::mutex> lock(state_->mutex);
     return state_->tier(location).usage;
 }
 BackendPoolStats TieredStorage::pool_stats(StorageLocation location) const {
-    std::unique_lock<std::mutex> lock(state_->mutex);
-    const auto& tier = state_->tier(location);
-    auto* backend = tier.backend.get();
-    lock.unlock();
+    const auto* backend = state_->tier(location).backend.get();
     return backend ? backend->pool_stats() : BackendPoolStats{};
 }
 BackendIOStats TieredStorage::io_stats(StorageLocation location) const {
-    std::unique_lock<std::mutex> lock(state_->mutex);
-    auto* backend = state_->tier(location).backend.get();
-    lock.unlock();
+    const auto* backend = state_->tier(location).backend.get();
     return backend ? backend->io_stats() : BackendIOStats{};
 }
 bool TieredStorage::erase(BlockId id) {
@@ -439,21 +457,19 @@ MigrationResult TieredStorage::migrate(BlockId id, StorageLocation target) {
     return record ? storage_detail::execute_transfer(*state_, *record)
                   : MigrationResult{true, false, {}};
 }
-std::future<MigrationResult> TieredStorage::migrate_async(BlockId id, StorageLocation target) {
+storage_detail::MigrationExecutor& TieredStorage::executor() {
     std::lock_guard<std::mutex> lock(executor_mutex_);
     if (!executor_)
         executor_ = std::make_unique<storage_detail::MigrationExecutor>(
             state_, state_->max_async_migrations);
-    return executor_->submit(id, target);
+    return *executor_;
 }
-
+std::future<MigrationResult> TieredStorage::migrate_async(BlockId id, StorageLocation target) {
+    return executor().submit(id, target);
+}
 std::future<std::vector<MigrationResult>>
 TieredStorage::migrate_batch_async(const std::vector<BlockId>& ids, StorageLocation target) {
-    std::lock_guard<std::mutex> lock(executor_mutex_);
-    if (!executor_)
-        executor_ = std::make_unique<storage_detail::MigrationExecutor>(
-            state_, state_->max_async_migrations);
-    return executor_->submit_batch(ids, target);
+    return executor().submit_batch(ids, target);
 }
 
 bool TieredStorage::retry_cleanup(BlockId id) {

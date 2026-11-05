@@ -139,4 +139,48 @@ TEST_F(AsyncKVPipelineTest, FailedReadDoesNotReachComputeAndRetiresPendingIO) {
     pipeline.begin_retire();
     EXPECT_NO_THROW(poll_until([&] { return pipeline.poll_retired(); }));
 }
+TEST_F(AsyncKVPipelineTest, ResidentDownloadAndRetirementPreserveAdmissionBoundaries) {
+    auto resident = config;
+    resident.gpu_resident = true;
+    std::size_t reads = 0, writes = 0;
+    AsyncKVPipeline pipeline(resident,
+        [&](const infer::LayerRead&) { ++reads; },
+        [&](std::size_t, std::size_t, const std::byte* key, const std::byte* value) {
+            for (std::size_t i = 0; i < config.row_bytes; ++i) {
+                EXPECT_EQ(key[i], std::byte{0});
+                EXPECT_EQ(value[i], std::byte{0});
+            }
+            ++writes;
+        });
+    const AsyncKVPipeline::Compute compute =
+        [&](std::size_t, AsyncKVPipeline::LayerView view, cudaStream_t stream) {
+            infer::check_cuda(cudaMemsetAsync(view.key, 0, config.row_bytes, stream), "clear key");
+            infer::check_cuda(cudaMemsetAsync(view.value, 0, config.row_bytes, stream), "clear value");
+        };
+    pipeline.begin_token(0);
+    EXPECT_THROW(pipeline.begin_token(0), std::logic_error);
+    ASSERT_TRUE(pipeline.tick(compute));
+    EXPECT_EQ(reads, 0u);
+    pipeline.flush_resident();
+    EXPECT_EQ(writes, layers);
+    pipeline.flush_resident();
+    EXPECT_EQ(writes, layers);
+
+    void* output = nullptr;
+    ASSERT_EQ(cudaMallocHost(&output, config.row_bytes), cudaSuccess);
+    const auto release = [](void* pointer) { cudaFreeHost(pointer); };
+    std::unique_ptr<void, decltype(release)> pinned(output, release);
+    pipeline.download(output, pipeline.graph_slot(0).key, config.row_bytes);
+    EXPECT_THROW(pipeline.begin_token(1), std::logic_error);
+    poll_until([&] { return pipeline.poll_download(); });
+    EXPECT_TRUE(pipeline.poll_download());
+    pipeline.begin_retire();
+    pipeline.begin_retire();
+    EXPECT_THROW(pipeline.begin_token(1), std::logic_error);
+    poll_until([&] { return pipeline.poll_retired(); });
+    EXPECT_THROW(pipeline.poll_retired(), std::logic_error);
+    pipeline.begin_token(0);
+    EXPECT_TRUE(pipeline.tick(compute));
+}
+
 } // namespace

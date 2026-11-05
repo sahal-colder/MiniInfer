@@ -1,7 +1,7 @@
 #include "infer/storage/kv_offload_cache.h"
 #include "infer/cpu/cpu_block.h"
 #include "infer/storage/tiered_storage.h"
-#include "storage_state.h"
+#include "scope_exit.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -88,9 +88,9 @@ std::size_t KVOffloadCache::allocation_size(std::size_t payload_bytes, bool comp
 struct KVOffloadCache::Impl {
     static constexpr std::size_t none = SIZE_MAX;
     struct Entry {
-        storage_detail::LogicalBlockRecord* block = nullptr;
-        BlockId id() const noexcept { return block ? block->meta.id : invalid_block_id; }
-        std::size_t size() const noexcept { return block ? block->meta.size : 0; }
+        const BlockMeta* block = nullptr;
+        BlockId id() const noexcept { return block ? block->id : invalid_block_id; }
+        std::size_t size() const noexcept { return block ? block->size : 0; }
         std::size_t previous = none, next = none;
         bool busy = false;
         std::size_t readers = 0;
@@ -99,7 +99,6 @@ struct KVOffloadCache::Impl {
         bool hot = false;
         std::uint64_t generation = 0;
         bool prefetched = false;
-        std::uint64_t prefetch_generation = 0;
         std::shared_future<bool> prefetch;
         bool prefetch_allows_eviction = true;
     };
@@ -140,14 +139,11 @@ struct KVOffloadCache::Impl {
         if (prefetch_worker.joinable())
             prefetch_worker.join();
     }
-    // Entry is only a scheduler binding. The shared core owns size, identity and placement.
-    storage_detail::LogicalBlockRecord* block(BlockId id) const {
-        std::lock_guard<std::mutex> lock(storage.state_->mutex);
-        return storage.state_->logical_blocks.at(id).get();
-    }
-    bool in_cpu(const Entry& entry) const {
-        std::lock_guard<std::mutex> lock(storage.state_->mutex);
-        return entry.block && entry.block->meta.location == StorageLocation::CPU;
+    // Only CPU residents are linked. Readers prevent migration; writer_mutex
+    // serializes placement changes, and busy hides an in-flight list update.
+    bool in_cpu(const Entry& entry) const noexcept {
+        return entry.previous != none || entry.next != none ||
+               (head != none && &entries[head] == &entry);
     }
     void run_prefetch();
     // 需求提升与后台预取共用迁移执行；只有预取标记后续的 prefetch hit。
@@ -201,37 +197,42 @@ struct KVOffloadCache::Impl {
         }
         return count;
     }
-    // Called without mutex held. Drain every accepted task before releasing any
-    // victim, including tasks accepted before submission/foreground write failure.
-    // Returns with lock held; each caller keeps its original error/unlock boundary.
-    void finish_demotions(std::unique_lock<std::mutex>& lock,
-                           const std::array<std::size_t, 16>& victims, std::size_t count,
-                           std::vector<std::future<MigrationResult>>& futures,
-                           std::exception_ptr& failure, const char* incomplete) {
-        for (std::size_t i = 0; i < futures.size(); ++i) {
-            MigrationResult result;
-            try {
-                result = futures[i].get();
-            } catch (...) {
-                if (!failure)
-                    failure = std::current_exception();
-            }
-            lock.lock();
-            if (result.committed) {
-                discard_prefetch(entries[victims[i]]);
-                remove(victims[i]);
-                ++counters.demotions;
-            }
-            lock.unlock();
-            if (!failure && result.error)
-                failure = result.error;
-            if (!failure && (!result.committed || result.cleanup_pending))
-                failure = std::make_exception_ptr(StorageBusy(incomplete));
+    // Every migration publishes its placement before reporting cleanup errors.
+    // Apply that committed placement even if the caller must subsequently throw.
+    void apply_migration(std::size_t index, const MigrationResult& result,
+                         StorageLocation target, bool prefetched = false, bool hot = false) {
+        if (!result.committed)
+            return;
+        auto& entry = entries[index];
+        if (target == StorageLocation::SSD) {
+            discard_prefetch(entry);
+            remove(index);
+            ++counters.demotions;
+            return;
         }
+        entry.ssd_hit_count = 0;
+        entry.prefetched = prefetched;
+        touch(index);
+        if (hot) {
+            mark_hot(index);
+            ++counters.hot_promotions;
+        }
+        ++counters.promotions;
+    }
+    static void require_complete(const MigrationResult& result) {
+        if (result.error)
+            std::rethrow_exception(result.error);
+        if (!result.committed || result.cleanup_pending)
+            throw StorageBusy("Offload migration incomplete");
+    }
+    // Caller holds writer_mutex and protects the slot before releasing mutex.
+    void demote(std::unique_lock<std::mutex>& lock, std::size_t index) {
+        lock.unlock();
+        Timer timer{demotion_ns};
+        const auto result = storage.migrate(entries[index].id(), StorageLocation::SSD);
         lock.lock();
-        for (std::size_t i = 0; i < count; ++i)
-            entries[victims[i]].busy = false;
-        changed.notify_all();
+        apply_migration(index, result, StorageLocation::SSD);
+        require_complete(result);
     }
     void discard_prefetch(Entry& entry) noexcept {
         if (entry.prefetched) {
@@ -290,12 +291,9 @@ struct KVOffloadCache::Impl {
         }
     }
     // 调用方持有 writer_mutex；元数据锁只覆盖索引操作，复制/I/O 在锁外。
-    std::size_t cpu_allocation_size(std::size_t bytes) const {
-        return storage.state_->cpu_tier.backend->allocation_bytes(bytes);
-    }
     void write_one(std::size_t index, const void *data, std::size_t bytes = 0);
-    void make_room_for_batch(const std::vector<std::size_t>& slots);
-    void write_overlapped(const std::vector<std::size_t>& slots, const std::vector<void*>& buffers);
+    void write_batch(const std::vector<std::size_t>& slots, const std::vector<void*>& buffers,
+                     bool overlap);
 
     void make_room(std::unique_lock<std::mutex> &lock, bool cold_only = false,
                    std::size_t bytes = 0) {
@@ -316,32 +314,13 @@ struct KVOffloadCache::Impl {
                 throw StorageBusy("CPU capacity held by pending cleanup");
             changed.wait(lock);
         }
-        auto& entry = entries[selected];
-        entry.busy = true;
-        const auto id = entry.id();
-        lock.unlock();
-        MigrationResult result;
-        try {
-            Timer timer{demotion_ns};
-            result = storage.migrate(id, StorageLocation::SSD);
-        } catch (...) {
-            lock.lock();
-            entry.busy = false;
+        entries[selected].busy = true;
+        storage_detail::ScopeExit release([&] {
+            if (!lock.owns_lock()) lock.lock();
+            entries[selected].busy = false;
             changed.notify_all();
-            throw;
-        }
-        lock.lock();
-        entry.busy = false;
-        changed.notify_all();
-        if (result.committed) {
-            discard_prefetch(entry);
-            remove(selected);
-            ++counters.demotions;
-        }
-        if (result.error)
-            std::rethrow_exception(result.error);
-        if (!result.committed || result.cleanup_pending)
-            throw StorageBusy("Offload demotion incomplete");
+        });
+        demote(lock, selected);
     }
 };
 KVOffloadCache::KVOffloadCache(KVOffloadConfig config, std::unique_ptr<StorageBackend> cpu,
@@ -360,6 +339,11 @@ void KVOffloadCache::Impl::write_one(std::size_t index, const void *data, std::s
     auto& entry = entries.at(index);
     changed.wait(lock, [&] { return !entry.busy; });
     entry.busy = true;
+    storage_detail::ScopeExit release([&] {
+        if (!lock.owns_lock()) lock.lock();
+        entry.busy = false;
+        changed.notify_all();
+    });
     BlockId fresh = invalid_block_id;
     try {
         // Reserve the slot before draining existing readers so new readers
@@ -369,9 +353,9 @@ void KVOffloadCache::Impl::write_one(std::size_t index, const void *data, std::s
             throw std::overflow_error("KV slot generation exhausted");
         const auto old = entry.id();
         const bool overwrite = in_cpu(entry) &&
-            cpu_allocation_size(entry.size()) == cpu_allocation_size(bytes);
+            storage.cpu_allocation_size(entry.size()) == storage.cpu_allocation_size(bytes);
         if (!overwrite) {
-            const auto capacity = cpu_allocation_size(bytes);
+            const auto capacity = storage.cpu_allocation_size(bytes);
             for (;;) {
                 const auto usage = storage.stats(StorageLocation::CPU);
                 if (capacity <= usage.limit_bytes - usage.reserved_bytes)
@@ -384,17 +368,7 @@ void KVOffloadCache::Impl::write_one(std::size_t index, const void *data, std::s
                                                 "No capacity for transactional KV resize");
                     // Preserve the old acknowledged contents on SSD before
                     // reclaiming their CPU capacity. The slot stays busy.
-                    lock.unlock();
-                    auto result = storage.migrate(old, StorageLocation::SSD);
-                    lock.lock();
-                    if (result.committed) {
-                        discard_prefetch(entry);
-                        remove(index);
-                        ++counters.demotions;
-                    }
-                    if (result.error) std::rethrow_exception(result.error);
-                    if (!result.committed || result.cleanup_pending)
-                        throw StorageBusy("KV resize source demotion incomplete");
+                    demote(lock, index);
                     continue;
                 }
                 make_room(lock, false, capacity);
@@ -418,7 +392,8 @@ void KVOffloadCache::Impl::write_one(std::size_t index, const void *data, std::s
             ++counters.populated_slots;
         discard_prefetch(entry);
         ++entry.generation;
-        entry.block = block(id);
+        entry.block = storage.bind_metadata(id);
+        entry.prefetch = {};
         entry.ssd_hit_count = 0;
         entry.cpu_reads = 0;
         clear_hot(entry);
@@ -442,14 +417,8 @@ void KVOffloadCache::Impl::write_one(std::size_t index, const void *data, std::s
                            stderr);
             }
         }
-        if (!lock.owns_lock())
-            lock.lock();
-        entry.busy = false;
-        changed.notify_all();
         throw;
     }
-    entry.busy = false;
-    changed.notify_all();
 }
 
 void KVOffloadCache::write(std::size_t index, const void* data) {
@@ -520,53 +489,11 @@ std::size_t KVOffloadCache::read(std::size_t index, void* data, std::size_t capa
     }
     return bytes;
 }
-void KVOffloadCache::Impl::make_room_for_batch(const std::vector<std::size_t>& slots) {
-    if (!config.enable_ssd || config.write_concurrency == 1)
-        return;
-    std::unique_lock<std::mutex> lock(mutex);
-    const auto usage = storage.stats(StorageLocation::CPU);
-    const auto slot_bytes = usage.limit_bytes / config.cpu_slots;
-    const auto free = (usage.limit_bytes - usage.reserved_bytes) / slot_bytes;
-    std::size_t incoming = 0;
-    for (auto index : slots)
-        incoming += !in_cpu(entries[index]);
-    auto needed = incoming > free ? incoming - free : 0;
-    if (!needed)
-        return;
-    std::array<std::size_t, 16> victims{};
-    std::vector<std::future<MigrationResult>> futures;
-    futures.reserve(config.write_concurrency);
-    while (needed) {
-        // 每波重新选择并保护源；不会把上一波 I/O 期间新进入的读者当作空闲。
-        const auto count =
-            select_victims(slots, std::min(needed, config.write_concurrency), victims);
-        if (!count)
-            return; // 剩余忙槽由逐槽写入等待，不阻断读者。
-        for (std::size_t i = 0; i < count; ++i)
-            entries[victims[i]].busy = true;
-        lock.unlock();
-        Timer timer{demotion_ns};
-        futures.clear();
-        std::exception_ptr failure;
-        try {
-            for (std::size_t i = 0; i < count; ++i)
-                futures.push_back(
-                    storage.migrate_async(entries[victims[i]].id(), StorageLocation::SSD));
-        } catch (...) {
-            failure = std::current_exception();
-        }
-        finish_demotions(lock, victims, count, futures, failure, "Batch demotion incomplete");
-        if (failure)
-            std::rethrow_exception(failure);
-        needed -= count;
-    }
-}
-
-void KVOffloadCache::Impl::write_overlapped(const std::vector<std::size_t>& slots,
-                                            const std::vector<void*>& buffers) {
+void KVOffloadCache::Impl::write_batch(const std::vector<std::size_t>& slots,
+                                       const std::vector<void*>& buffers, bool overlap) {
     std::size_t next = 0;
-    std::vector<std::future<MigrationResult>> futures;
-    futures.reserve(config.write_concurrency);
+    std::array<std::size_t, 16> victims{};
+    std::array<std::future<MigrationResult>, 16> futures;
     while (next < slots.size()) {
         std::unique_lock<std::mutex> lock(mutex);
         const auto usage = storage.stats(StorageLocation::CPU);
@@ -576,28 +503,33 @@ void KVOffloadCache::Impl::write_overlapped(const std::vector<std::size_t>& slot
         for (auto i = next; i < slots.size(); ++i)
             incoming += !in_cpu(entries[slots[i]]);
         const auto needed = incoming > free ? incoming - free : 0;
-        std::array<std::size_t, 16> victims{};
-        const auto count =
-            select_victims(slots, std::min(needed, config.write_concurrency), victims);
+        const auto count = select_victims(slots, std::min(needed, config.write_concurrency), victims);
         if (!count) {
             lock.unlock();
-            // No independent victim: the ordinary path handles full capacity
-            // and requested-slot replacement, retaining its waiting semantics.
-            write_one(slots[next], buffers[next]);
-            ++next;
+            // Ordinary writes retain waiting and requested-slot replacement semantics.
+            do {
+                write_one(slots[next], buffers[next]);
+                ++next;
+            } while (!overlap && next < slots.size());
             continue;
         }
         for (std::size_t i = 0; i < count; ++i)
             entries[victims[i]].busy = true;
+        storage_detail::ScopeExit release([&] {
+            if (!lock.owns_lock()) lock.lock();
+            for (std::size_t i = 0; i < count; ++i)
+                entries[victims[i]].busy = false;
+            changed.notify_all();
+        });
         lock.unlock();
-        futures.clear();
+        std::size_t submitted = 0;
         std::exception_ptr failure;
         Timer timer{demotion_ns};
         try {
-            for (std::size_t i = 0; i < count; ++i)
-                futures.push_back(
-                    storage.migrate_async(entries[victims[i]].id(), StorageLocation::SSD));
-            while (next < slots.size()) {
+            for (; submitted < count; ++submitted)
+                futures[submitted] =
+                    storage.migrate_async(entries[victims[submitted]].id(), StorageLocation::SSD);
+            while (overlap && next < slots.size()) {
                 lock.lock();
                 const bool overwrite = in_cpu(entries[slots[next]]);
                 lock.unlock();
@@ -614,8 +546,19 @@ void KVOffloadCache::Impl::write_overlapped(const std::vector<std::size_t>& slot
         } catch (...) {
             failure = std::current_exception();
         }
-        finish_demotions(lock, victims, count, futures, failure, "Overlapped demotion incomplete");
-        lock.unlock();
+        // Drain all accepted tasks before releasing any victim, even after a
+        // submission or foreground write failed. Keep the first failure.
+        for (std::size_t i = 0; i < submitted; ++i) {
+            try {
+                const auto result = futures[i].get();
+                lock.lock();
+                apply_migration(victims[i], result, StorageLocation::SSD);
+                lock.unlock();
+                require_complete(result);
+            } catch (...) {
+                if (!failure) failure = std::current_exception();
+            }
+        }
         if (failure)
             std::rethrow_exception(failure);
     }
@@ -654,11 +597,11 @@ void KVOffloadCache::write_many(const std::vector<std::size_t> &slots,
     }
     // Overlap estimates free space in fixed slots. A variable-size replacement
     // can need the busy victim whose future this same writer must consume.
-    if (impl_->config.enable_ssd && impl_->config.overlap_writeback && !impl_->config.variable_payloads) {
-        impl_->write_overlapped(slots, buffers);
+    const bool overlap = impl_->config.overlap_writeback && !impl_->config.variable_payloads;
+    if (impl_->config.enable_ssd && (overlap || impl_->config.write_concurrency > 1)) {
+        impl_->write_batch(slots, buffers, overlap);
         return;
     }
-    impl_->make_room_for_batch(slots);
     for (std::size_t i = 0; i < slots.size(); ++i)
         impl_->write_one(slots[i], buffers[i]);
 }
@@ -754,7 +697,7 @@ void KVOffloadCache::Impl::run_prefetch() {
         }
         lock.lock();
         auto& entry = entries[job.index];
-        if (entry.prefetch_generation == job.generation)
+        if (entry.generation == job.generation)
             entry.prefetch = {};
         --counters.prefetch_inflight;
         if (error)
@@ -794,7 +737,7 @@ bool KVOffloadCache::Impl::promote(std::size_t index, std::uint64_t generation, 
     if (entry.busy || entry.readers)
         return false;
     const auto usage = storage.stats(StorageLocation::CPU);
-    const auto capacity = cpu_allocation_size(entry.size());
+    const auto capacity = storage.cpu_allocation_size(entry.size());
     const bool needs_room = capacity > usage.limit_bytes - usage.reserved_bytes;
     if (needs_room) {
         if (!allow_eviction && !hot)
@@ -803,40 +746,22 @@ bool KVOffloadCache::Impl::promote(std::size_t index, std::uint64_t generation, 
             return false;
     }
     entry.busy = true;
-    MigrationResult result;
-    try {
-        for (;;) {
-            const auto available = storage.stats(StorageLocation::CPU);
-            if (capacity <= available.limit_bytes - available.reserved_bytes)
-                break;
-            make_room(lock, hot && !allow_eviction, capacity);
-        }
-        lock.unlock();
-        result = storage.migrate(entry.id(), StorageLocation::CPU);
-        lock.lock();
-        if (result.committed) {
-            entry.ssd_hit_count = 0;
-            entry.prefetched = prefetched;
-            touch(index);
-            if (hot) {
-                mark_hot(index);
-                ++counters.hot_promotions;
-            }
-            ++counters.promotions;
-        }
-        if (result.error)
-            std::rethrow_exception(result.error);
-        if (!result.committed || result.cleanup_pending)
-            throw StorageBusy("Prefetch incomplete");
-    } catch (...) {
-        if (!lock.owns_lock())
-            lock.lock();
+    storage_detail::ScopeExit release([&] {
+        if (!lock.owns_lock()) lock.lock();
         entry.busy = false;
         changed.notify_all();
-        throw;
+    });
+    for (;;) {
+        const auto available = storage.stats(StorageLocation::CPU);
+        if (capacity <= available.limit_bytes - available.reserved_bytes)
+            break;
+        make_room(lock, hot && !allow_eviction, capacity);
     }
-    entry.busy = false;
-    changed.notify_all();
+    lock.unlock();
+    const auto result = storage.migrate(entry.id(), StorageLocation::CPU);
+    lock.lock();
+    apply_migration(index, result, StorageLocation::CPU, prefetched, hot);
+    require_complete(result);
     return true;
 }
 
@@ -860,12 +785,9 @@ KVOffloadMeta KVOffloadCache::metadata(std::size_t index) const {
     impl_->changed.wait(lock, [&] { return !entry.busy; });
     if (!entry.block)
         return {};
-    std::lock_guard<std::mutex> core(impl_->storage.state_->mutex);
-    const auto& record = *entry.block;
-    return {record.meta.id, record.meta.size, record.meta.location, record.meta.version,
-            record.meta.location == StorageLocation::SSD ||
-                (record.ssd_copy.backend && !record.ssd_copy.pending &&
-                 record.ssd_copy_version == record.meta.version)};
+    bool ssd_copy = false;
+    const auto meta = impl_->storage.metadata(entry.id(), ssd_copy);
+    return {meta.id, meta.size, meta.location, meta.version, ssd_copy};
 }
 std::shared_future<bool> KVOffloadCache::prefetch_if_space_async(std::size_t index) {
     return submit_prefetch(index, false);
@@ -873,7 +795,7 @@ std::shared_future<bool> KVOffloadCache::prefetch_if_space_async(std::size_t ind
 std::shared_future<bool> KVOffloadCache::submit_prefetch(std::size_t index, bool allow_eviction) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     auto& entry = impl_->entries.at(index);
-    if (entry.prefetch.valid() && entry.prefetch_generation == entry.generation) {
+    if (entry.prefetch.valid()) {
         if (!allow_eviction && entry.prefetch_allows_eviction) {
             return ready_future(false);
         }
@@ -900,7 +822,6 @@ std::shared_future<bool> KVOffloadCache::submit_prefetch(std::size_t index, bool
     if (!impl_->prefetch_worker.joinable())
         impl_->prefetch_worker = std::thread([state = impl_.get()] { state->run_prefetch(); });
     impl_->prefetch_queue.push_back(std::move(job));
-    entry.prefetch_generation = entry.generation;
     entry.prefetch = result;
     entry.prefetch_allows_eviction = allow_eviction;
     ++impl_->counters.prefetch_submitted;
@@ -921,28 +842,24 @@ bool KVOffloadCache::erase(std::size_t index) {
     if (entry.generation == UINT64_MAX)
         throw std::overflow_error("KV slot generation exhausted");
     entry.busy = true;
-    try {
-        impl_->changed.wait(lock, [&] { return !entry.readers; });
-        lock.unlock();
-        if (!impl_->storage.erase(entry.id()))
-            throw StorageBusy("KV slot is still in use");
-    } catch (...) {
-        if (!lock.owns_lock())
-            lock.lock();
+    storage_detail::ScopeExit release([&] {
+        if (!lock.owns_lock()) lock.lock();
         entry.busy = false;
         impl_->changed.notify_all();
-        throw;
-    }
+    });
+    impl_->changed.wait(lock, [&] { return !entry.readers; });
+    lock.unlock();
+    if (!impl_->storage.erase(entry.id()))
+        throw StorageBusy("KV slot is still in use");
     lock.lock();
     impl_->discard_prefetch(entry);
     impl_->remove(index);
     entry.block = nullptr;
+    entry.prefetch = {};
     entry.ssd_hit_count = 0;
     ++entry.generation;
-    entry.busy = false;
     --impl_->counters.populated_slots;
     ++impl_->counters.invalidations;
-    impl_->changed.notify_all();
     return true;
 }
 
@@ -1006,9 +923,7 @@ KVOffloadStats KVOffloadCache::stats() const {
     return result;
 }
 std::shared_ptr<SSDDmaBuffer> KVOffloadCache::allocate_dma_buffer(std::size_t bytes) {
-    auto* backend = dynamic_cast<SSDStorageBackend*>(
-        impl_->storage.state_->tier(StorageLocation::SSD).backend.get());
-    return backend ? backend->allocate_dma_buffer(bytes) : std::shared_ptr<SSDDmaBuffer>{};
+    return impl_->storage.allocate_dma_buffer(bytes);
 }
 
 } // namespace infer

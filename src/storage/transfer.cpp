@@ -7,6 +7,16 @@
 
 namespace infer::storage_detail {
 
+std::size_t StorageState::available_staging() {
+    if (!staging)
+        staging = std::make_unique<TransferSlots>(block_bytes,
+            dynamic_cast<SSDStorageBackend*>(ssd_tier.backend.get()));
+    const auto slot = std::find(staging->busy.begin(), staging->busy.end(), false);
+    if (slot == staging->busy.end())
+        throw StorageBusy("Both pinned transfer slots are busy");
+    return slot - staging->busy.begin();
+}
+
 namespace {
 LogicalBlockRecord* prepare_locked(StorageState& state, BlockId id, StorageLocation target,
                                    bool batch) {
@@ -35,14 +45,7 @@ LogicalBlockRecord* prepare_locked(StorageState& state, BlockId id, StorageLocat
     std::size_t staging = 2;
     if (uses_gpu) {
         if (!batch && !op->direct_host) {
-            if (!state.staging)
-                state.staging = std::make_unique<TransferSlots>(state.block_bytes,
-                    dynamic_cast<SSDStorageBackend*>(state.ssd_tier.backend.get()));
-            staging = 0;
-            while (staging < 2 && state.staging->busy[staging])
-                ++staging;
-            if (staging == 2)
-                throw StorageBusy("Both pinned transfer slots are busy");
+            staging = state.available_staging();
         }
         op->gpu = target == StorageLocation::GPU ? target_tier.backend.get() : record.backend;
     }
@@ -108,14 +111,7 @@ std::vector<LogicalBlockRecord*> prepare_batch(StorageState& state, const std::v
         }
         staging = 2;
         if (uses_gpu) {
-            if (!state.staging)
-                state.staging = std::make_unique<TransferSlots>(state.block_bytes,
-                    dynamic_cast<SSDStorageBackend*>(state.ssd_tier.backend.get()));
-            staging = 0;
-            while (staging < 2 && state.staging->busy[staging])
-                ++staging;
-            if (staging == 2)
-                throw StorageBusy("Both pinned transfer slots are busy");
+            staging = state.available_staging();
             for (auto* record : records)
                 if (record && record->transfer->gpu && !record->transfer->direct_host) {
                     record->transfer->staging = staging;
@@ -406,11 +402,7 @@ std::exception_ptr cleanup_ssd_copy(StorageState& state, LogicalBlockRecord& rec
         return {};
     {
         std::lock_guard<std::mutex> lock(state.mutex);
-        if (!copy.pending) {
-            state.ssd_tier.transition(StorageCharge::REPLICA, StorageCharge::PENDING_CLEANUP,
-                                      copy.bytes);
-            copy.pending = true;
-        }
+        state.charge_pending(copy, StorageCharge::REPLICA);
         record.ssd_copy_version = 0;
     }
     try {
@@ -434,12 +426,8 @@ std::exception_ptr cleanup_transfer(StorageState& state, LogicalBlockRecord& rec
             state.charge_cleanup(record);
             op.source_quarantined = true;
             auto& resource = op.auxiliary;
-            if (resource.backend && !resource.pending) {
-                state.tier(resource.backend->location())
-                    .transition(StorageCharge::MIGRATION, StorageCharge::PENDING_CLEANUP,
-                                resource.bytes);
-                resource.pending = true;
-            }
+            if (resource.backend)
+                state.charge_pending(resource, StorageCharge::MIGRATION);
             return std::current_exception();
         }
         op.completion_unknown = false;
@@ -469,12 +457,7 @@ std::exception_ptr cleanup_transfer(StorageState& state, LogicalBlockRecord& rec
                 resource.backend->release(resource.handle);
         } catch (...) {
             std::lock_guard<std::mutex> lock(state.mutex);
-            if (!resource.pending) {
-                state.tier(resource.backend->location())
-                    .transition(StorageCharge::MIGRATION, StorageCharge::PENDING_CLEANUP,
-                                resource.bytes);
-                resource.pending = true;
-            }
+            state.charge_pending(resource, StorageCharge::MIGRATION);
             return std::current_exception();
         }
         std::lock_guard<std::mutex> lock(state.mutex);

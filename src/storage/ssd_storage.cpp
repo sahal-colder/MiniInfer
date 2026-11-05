@@ -232,10 +232,6 @@ struct SSDStorageBackend::Impl {
     struct Allocation {
         mutable std::mutex mutex;
         std::size_t slot = 0, written = 0;
-        // The logical page maps to this record within a submitted chunk.
-        // Length and checksum remain in meta.size and crc.
-        std::uint64_t chunk_lba = 0;
-        std::size_t chunk_offset = 0;
         std::uint32_t crc = ~0u;
         bool sealed = false;
         bool released = false;
@@ -246,7 +242,6 @@ struct SSDStorageBackend::Impl {
     std::string pending_file;
     std::size_t payload = 0, record = 0, max_slots = 0;
     std::size_t payload_offset = record_header_bytes;
-    std::size_t sector = 1;
     CachingCPUDeviceAllocator chunk_pool;
     // Aligned device records share immutable zero padding; only their 64-byte
     // identity headers scale with the bounded batch. Files keep their v1 layout.
@@ -337,18 +332,39 @@ struct SSDStorageBackend::Impl {
         std::lock_guard<std::mutex> lock(mutex);
         return allocations.at(handle);
     }
+    // Both batch directions lock records in handle order; the returned order
+    // remains available for sharding and device coalescing.
+    template <class Request>
+    std::vector<std::size_t> lock_batch(const std::vector<Request>& requests,
+                                       std::vector<std::shared_ptr<Allocation>>& allocations,
+                                       std::vector<std::unique_lock<std::mutex>>& locks) const {
+        std::vector<std::size_t> order(requests.size());
+        for (std::size_t i = 0; i < order.size(); ++i)
+            order[i] = i;
+        std::sort(order.begin(), order.end(),
+                  [&](auto a, auto b) { return requests[a].handle < requests[b].handle; });
+        for (std::size_t i = 1; i < order.size(); ++i)
+            if (requests[order[i - 1]].handle == requests[order[i]].handle)
+                throw std::invalid_argument("Duplicate SSD batch handle");
+        locks.reserve(requests.size());
+        for (auto i : order) {
+            allocations[i] = lookup(requests[i].handle);
+            locks.emplace_back(allocations[i]->mutex);
+            check_live(*allocations[i]);
+        }
+        return order;
+    }
     static void check_live(const Allocation& allocation) {
         if (allocation.released)
             throw std::out_of_range("Released SSD handle");
     }
     off_t offset(const Allocation& allocation) const {
         // 构造时已限制 file budget <= off_t::max，slot < max_slots。
-        return static_cast<off_t>(allocation.chunk_lba * sector + allocation.chunk_offset);
+        return static_cast<off_t>(allocation.slot * record);
     }
     // Group only adjacent, full records. Holes and short records keep their own
     // ranges so a chunk never writes another page's sector or reads unused tails.
     void device_batch(bool write, const std::vector<FileIORequest>& ranges,
-                      const std::vector<std::shared_ptr<Allocation>>& entries,
                       std::vector<std::size_t> order) {
         if (metadata_padding.empty() || order.size() < 2 || record > 1024 * 1024) {
             if (write) device->write_many(ranges);
@@ -426,40 +442,49 @@ struct SSDStorageBackend::Impl {
             }
             if (write) device->write_many(wave);
             else device->read_many(wave);
+            if (write)
+                continue;
             for (const auto& chunk : chunks) {
-                const auto base = ranges[2 * order[chunk.first]].offset;
+                if (!chunk.buffer)
+                    continue;
                 for (auto j = chunk.first; j < chunk.end; ++j) {
                     const auto i = order[j];
-                    const auto relative = (j - chunk.first) * record;
-                    if (write) {
-                        entries[i]->chunk_lba = base / sector;
-                        entries[i]->chunk_offset = relative;
-                    } else if (chunk.buffer) {
-                        const auto* data = static_cast<const char*>(chunk.buffer.get()) + relative;
-                        std::memcpy(ranges[2 * i].data, data, record_header_bytes);
-                        std::memcpy(ranges[2 * i + 1].data, data + payload_offset, payload);
-                    }
+                    const auto* data = static_cast<const char*>(chunk.buffer.get()) +
+                                       (j - chunk.first) * record;
+                    std::memcpy(ranges[2 * i].data, data, record_header_bytes);
+                    std::memcpy(ranges[2 * i + 1].data, data + payload_offset, payload);
                 }
             }
         }
+    }
+    std::uint32_t read_crc(const Allocation& allocation, void* host, std::size_t begin,
+                           std::size_t bytes, FileIO* lane = nullptr) const {
+        std::uint32_t crc = ~0u;
+        for (std::size_t done = 0; done < bytes;) {
+            const auto n = std::min(read_piece_bytes ? read_piece_bytes : bytes, bytes - done);
+            auto* destination = static_cast<unsigned char*>(host) + done;
+            read_range(destination, n, offset(allocation) + payload_offset + begin + done, lane);
+            read_bytes.fetch_add(n, std::memory_order_relaxed);
+            crc = extend_crc(crc, destination, n);
+            done += n;
+        }
+        return ~crc;
+    }
+    static void check_crc(std::uint32_t crc, const Header& header) {
+        if (crc != get(header, 48, 4))
+            throw std::system_error(EBADMSG, std::generic_category(), "SSD payload CRC32C mismatch");
+    }
+    void check_payload(const StorageRead& request, const Header& header) const {
+        if (verification != SSDVerification::NONE)
+            check_crc(storage_detail::crc32c(request.host, request.expected.size), header);
     }
     // 在同一遍读取中计算 CRC 并提取请求区间，避免先校验后另读引入内容差异。
     std::uint32_t payload_crc(const Allocation& allocation, std::size_t size, void* host = nullptr,
                               std::size_t begin = 0, std::size_t bytes = 0,
                               FileIO* lane = nullptr) const {
         // 完整块直接读入最终 CPU/Pinned 地址；部分读取仍校验整条记录。
-        if (host && begin == 0 && bytes == size) {
-            std::uint32_t crc = ~0u;
-            for (std::size_t done = 0; done < size;) {
-                const auto n = std::min(read_piece_bytes ? read_piece_bytes : size, size - done);
-                auto* destination = static_cast<unsigned char*>(host) + done;
-                read_range(destination, n, offset(allocation) + payload_offset + done, lane);
-                read_bytes.fetch_add(n, std::memory_order_relaxed);
-                crc = extend_crc(crc, destination, n);
-                done += n;
-            }
-            return ~crc;
-        }
+        if (host && begin == 0 && bytes == size)
+            return read_crc(allocation, host, 0, size, lane);
         // ALIGNED_CRC_SCRATCH: retain one full direct read per 64 KiB CRC
         // window instead of bouncing every 4 KiB through DirectFile scratch.
         alignas(4096) std::array<unsigned char, 64 * 1024> buffer{};
@@ -508,9 +533,7 @@ struct SSDStorageBackend::Impl {
             }
             return;
         }
-        if (payload_crc(allocation, expected.size, host, begin, bytes, lane) != get(header, 48, 4)) {
-            throw std::system_error(EBADMSG, std::generic_category(), "SSD payload CRC32C mismatch");
-        }
+        check_crc(payload_crc(allocation, expected.size, host, begin, bytes, lane), header);
     }
     void parallel_read(const Allocation& allocation, const BlockMeta& expected, void* host) {
         if (verification == SSDVerification::NONE) {
@@ -529,25 +552,16 @@ struct SSDStorageBackend::Impl {
         parallel[false].batch->run([&](std::size_t lane) {
             const auto begin = std::min(expected.size, lane * chunk);
             const auto end = std::min(expected.size, (lane + 1) * chunk);
-            std::uint32_t crc = ~0u;
-            for (auto done = begin; done < end;) {
-                const auto n = std::min(read_piece_bytes, end - done);
-                auto* destination = static_cast<unsigned char*>(host) + done;
-                read_range(destination, n, offset(allocation) + payload_offset + done,
-                           parallel_posix ? nullptr : parallel[false].lanes[lane].get());
-                read_bytes.fetch_add(n, std::memory_order_relaxed);
-                crc = extend_crc(crc, destination, n);
-                done += n;
-            }
-            crcs[lane] = ~crc;
+            crcs[lane] = read_crc(allocation, static_cast<unsigned char*>(host) + begin,
+                                    begin, end - begin,
+                                    parallel_posix ? nullptr : parallel[false].lanes[lane].get());
             sizes[lane] = end - begin;
         });
         // BatchIO drains every accepted range before any error or CRC is returned.
         auto crc = crcs[0];
         for (std::size_t i = 1; i < crcs.size(); ++i)
             crc = combine_crc(crc, crcs[i], sizes[i]);
-        if (crc != get(header, 48, 4))
-            throw std::system_error(EBADMSG, std::generic_category(), "SSD payload CRC32C mismatch");
+        check_crc(crc, header);
     }
 };
 
@@ -639,7 +653,6 @@ SSDStorageBackend::SSDStorageBackend(std::size_t bytes, std::size_t budget,
         state->metadata_padding.resize(alignment - record_header_bytes);
     }
     state->record = record;
-    state->sector = alignment;
     state->max_slots = slots;
     state->verification = verification;
     state->device = std::move(device);
@@ -672,7 +685,6 @@ StorageHandle SSDStorageBackend::reserve() {
     return impl_->allocations.create([&](std::size_t slot) {
         auto allocation = std::make_shared<Impl::Allocation>();
         allocation->slot = slot;
-        allocation->chunk_lba = slot * impl_->record / impl_->sector;
         return allocation;
     }, impl_->max_slots);
 }
@@ -753,22 +765,11 @@ void SSDStorageBackend::write_published_many(const std::vector<StorageWrite>& re
     if (requests.size() > 64)
         throw std::invalid_argument("SSD write batch exceeds 64 blocks");
     IOTimer timer{impl_->write_ns};
-    std::vector<std::size_t> order(requests.size());
-    for (std::size_t i = 0; i < order.size(); ++i)
-        order[i] = i;
-    std::sort(order.begin(), order.end(),
-              [&](auto a, auto b) { return requests[a].handle < requests[b].handle; });
-    for (std::size_t i = 1; i < order.size(); ++i)
-        if (requests[order[i - 1]].handle == requests[order[i]].handle)
-            throw std::invalid_argument("Duplicate SSD write handle");
     std::vector<std::shared_ptr<Impl::Allocation>> allocations(requests.size());
     std::vector<std::unique_lock<std::mutex>> locks;
     std::vector<Header> headers(requests.size());
-    locks.reserve(requests.size());
+    const auto order = impl_->lock_batch(requests, allocations, locks);
     for (auto i : order) {
-        allocations[i] = impl_->lookup(requests[i].handle);
-        locks.emplace_back(allocations[i]->mutex);
-        Impl::check_live(*allocations[i]);
         const auto& r = requests[i];
         storage_detail::validate_io(impl_->payload, 0, r.host, r.meta.size);
         if (!r.meta.id || !r.meta.version || !r.meta.size)
@@ -828,7 +829,7 @@ void SSDStorageBackend::write_published_many(const std::vector<StorageWrite>& re
         }
         // Small records use one writev/SQE; large payloads precede their final header.
         if (impl_->device)
-            impl_->device_batch(true, ranges, allocations, selected);
+            impl_->device_batch(true, ranges, selected);
         else
             io->write_many(impl_->files[lane % impl_->file_count], ranges);
         for (auto i : selected) {
@@ -908,25 +909,13 @@ void SSDStorageBackend::read_validated_many(const std::vector<StorageRead>& requ
     if (requests.size() > 64)
         throw std::invalid_argument("SSD read batch exceeds 64 blocks");
     IOTimer timer{impl_->read_ns};
-    std::vector<std::size_t> order(requests.size());
-    for (std::size_t i = 0; i < order.size(); ++i)
-        order[i] = i;
-    std::sort(order.begin(), order.end(),
-              [&](auto a, auto b) { return requests[a].handle < requests[b].handle; });
-    for (std::size_t i = 1; i < order.size(); ++i)
-        if (requests[order[i - 1]].handle == requests[order[i]].handle)
-            throw std::invalid_argument("Duplicate SSD read handle");
     std::vector<std::shared_ptr<Impl::Allocation>> allocations(requests.size());
     std::vector<std::unique_lock<std::mutex>> locks;
     std::vector<Header> headers(requests.size());
     std::vector<FileIORequest> ranges(2 * requests.size());
-    locks.reserve(requests.size());
-    // 固定句柄顺序拿记录锁，避免两个并发批次反序访问时死锁。
+    auto order = impl_->lock_batch(requests, allocations, locks);
     for (auto i : order) {
-        allocations[i] = impl_->lookup(requests[i].handle);
-        locks.emplace_back(allocations[i]->mutex);
         const auto& allocation = *allocations[i];
-        Impl::check_live(allocation);
         if (!allocation.sealed)
             throw std::logic_error("SSD batch record is not published");
         storage_detail::validate_io(impl_->payload, 0, requests[i].host, requests[i].expected.size);
@@ -1004,10 +993,7 @@ void SSDStorageBackend::read_validated_many(const std::vector<StorageRead>& requ
                         impl_->check_header(*allocations[i], requests[i].expected, headers[i]);
                         impl_->read_bytes.fetch_add(requests[i].expected.size,
                                                     std::memory_order_relaxed);
-                        if (impl_->verification != SSDVerification::NONE &&
-                            storage_detail::crc32c(requests[i].host, requests[i].expected.size) !=
-                            get(headers[i], 48, 4))
-                            throw std::system_error(EBADMSG, std::generic_category(), "SSD batch payload CRC32C mismatch");
+                        impl_->check_payload(requests[i], headers[i]);
                     }
                     first = last;
                 }
@@ -1030,7 +1016,7 @@ void SSDStorageBackend::read_validated_many(const std::vector<StorageRead>& requ
                             0,requests[0].expected.size,impl_->parallel[false].lanes[lane].get());
         return;
     } else if (impl_->device)
-        impl_->device_batch(false, ranges, allocations, std::move(order));
+        impl_->device_batch(false, ranges, std::move(order));
     else if (impl_->file_count > 1) {
         for (std::size_t i = 0; i < requests.size(); ++i)
             impl_->checked_read(*allocations[i], requests[i].expected, requests[i].host, 0,
@@ -1040,15 +1026,10 @@ void SSDStorageBackend::read_validated_many(const std::vector<StorageRead>& requ
         impl_->io->read_many(impl_->files[0], ranges);
     for (const auto& request : requests)
         impl_->read_bytes.fetch_add(request.expected.size, std::memory_order_relaxed);
-    const auto verify = [&](std::size_t i) {
+    for (std::size_t i = 0; i < requests.size(); ++i) {
         impl_->check_header(*allocations[i], requests[i].expected, headers[i]);
-        if (impl_->verification != SSDVerification::NONE &&
-            storage_detail::crc32c(requests[i].host, requests[i].expected.size) !=
-            get(headers[i], 48, 4))
-            throw std::system_error(EBADMSG, std::generic_category(), "SSD batch payload CRC32C mismatch");
-    };
-    for (std::size_t i = 0; i < requests.size(); ++i)
-        verify(i);
+        impl_->check_payload(requests[i], headers[i]);
+    }
 }
 void SSDStorageBackend::read(StorageHandle handle, std::size_t offset, void* host,
                              std::size_t bytes) {

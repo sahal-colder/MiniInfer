@@ -131,6 +131,15 @@ struct StorageState {
     TierState& tier(StorageLocation location);
     void charge_cleanup(LogicalBlockRecord& record) noexcept; // 调用方持有 mutex。
 
+    std::size_t available_staging(); // Caller holds mutex; reservation commits after preparation.
+    void charge_pending(TransferResource& resource, StorageCharge from) noexcept {
+        if (!resource.pending) {
+            tier(resource.backend->location())
+                .transition(from, StorageCharge::PENDING_CLEANUP, resource.bytes);
+            resource.pending = true;
+        }
+    }
+
     // meta/usage/操作保护在锁内访问；锁外 I/O 依靠 Lease 或 operation_busy 保活。
     // 后端不得重入 Storage。等待 consumer stream 时不得持有本锁。
     std::mutex mutex;

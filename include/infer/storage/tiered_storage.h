@@ -136,7 +136,16 @@ class TieredStorage {
   private:
     BlockLease acquire_impl(BlockId id, AccessMode mode, cudaStream_t stream,
                             StorageLocation expected, std::size_t bytes = 0);
+    void read_to_host_many_impl(const std::vector<BlockId>& ids,
+                                const std::vector<void*>& destinations, std::size_t bytes,
+                                const std::vector<std::size_t>* sizes);
+    storage_detail::MigrationExecutor& executor();
     friend class KVOffloadCache;
+    // Borrowed until erase; the cache serializes replacement and protects readers.
+    const BlockMeta* bind_metadata(BlockId id) const;
+    BlockMeta metadata(BlockId id, bool& ssd_copy) const;
+    std::size_t cpu_allocation_size(std::size_t bytes) const;
+    std::shared_ptr<SSDDmaBuffer> allocate_dma_buffer(std::size_t bytes);
     std::shared_ptr<storage_detail::StorageState> state_;
     std::mutex executor_mutex_;
     std::unique_ptr<storage_detail::MigrationExecutor> executor_;
