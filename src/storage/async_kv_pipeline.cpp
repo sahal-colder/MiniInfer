@@ -290,6 +290,14 @@ struct AsyncKVPipeline::Impl {
         return true;
     }
 
+    LayerView layer_view(const Slot& slot, std::size_t token_position) const {
+        auto* key = slot.device + (token_position / config.tokens_per_page) * config.page_bytes +
+                    (token_position % config.tokens_per_page) * config.row_bytes;
+        return {reinterpret_cast<float*>(key),
+                reinterpret_cast<float*>(key + config.tokens_per_page * config.row_bytes),
+                slot.table, config.tokens_per_page, config.row_bytes / sizeof(float)};
+    }
+
     bool try_compute(const Compute& compute) {
         const auto layer = next_compute;
         if (layer == next_upload) return false;
@@ -297,11 +305,7 @@ struct AsyncKVPipeline::Impl {
         if (slot.out_state != Output::Free) return false;
 
         check_cuda(cudaStreamWaitEvent(compute_stream_, slot.ready, 0), "wait for KV pages");
-        auto* key = slot.device + (position / config.tokens_per_page) * config.page_bytes +
-                    (position % config.tokens_per_page) * config.row_bytes;
-        const auto plane = config.tokens_per_page * config.row_bytes;
-        compute(layer, {reinterpret_cast<float*>(key), reinterpret_cast<float*>(key + plane),
-                        slot.table, config.tokens_per_page, config.row_bytes / sizeof(float)}, compute_stream_);
+        compute(layer, layer_view(slot, position), compute_stream_);
         check_cuda(cudaEventRecord(slot.compute_done, compute_stream_), "record KV consumer");
         check_cuda(cudaStreamWaitEvent(offload_d2h_stream_, slot.compute_done, 0), "wait for KV producer");
         download_rows(slot, position, count);
@@ -336,9 +340,7 @@ struct AsyncKVPipeline::Impl {
                         cudaMemcpyHostToDevice,compute_stream_), "restore resident prefix");
                 }
             }
-            auto* key=slot.device+(position/config.tokens_per_page)*config.page_bytes+(position%config.tokens_per_page)*config.row_bytes;
-            compute(layer,{reinterpret_cast<float*>(key),reinterpret_cast<float*>(key+config.tokens_per_page*config.row_bytes),
-                slot.table,config.tokens_per_page,config.row_bytes/sizeof(float)},compute_stream_);
+            compute(layer, layer_view(slot, position), compute_stream_);
         }
         if (!resident_initialized) dirty_begin=position;
         resident_initialized=true;
@@ -486,10 +488,7 @@ cudaStream_t AsyncKVPipeline::compute_stream() const noexcept { return impl_->co
 
 AsyncKVPipeline::LayerView AsyncKVPipeline::graph_slot(std::size_t index) const {
     const auto& s = *impl_;
-    const auto& slot = s.slots.at(index);
-    return {reinterpret_cast<float*>(slot.device),
-            reinterpret_cast<float*>(slot.device + s.config.tokens_per_page * s.config.row_bytes),
-            slot.table, s.config.tokens_per_page, s.config.row_bytes / sizeof(float)};
+    return s.layer_view(s.slots.at(index), 0);
 }
 
 void AsyncKVPipeline::download(void* pinned, const void* device, std::size_t bytes) {

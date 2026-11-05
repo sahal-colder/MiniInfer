@@ -201,6 +201,38 @@ struct KVOffloadCache::Impl {
         }
         return count;
     }
+    // Called without mutex held. Drain every accepted task before releasing any
+    // victim, including tasks accepted before submission/foreground write failure.
+    // Returns with lock held; each caller keeps its original error/unlock boundary.
+    void finish_demotions(std::unique_lock<std::mutex>& lock,
+                           const std::array<std::size_t, 16>& victims, std::size_t count,
+                           std::vector<std::future<MigrationResult>>& futures,
+                           std::exception_ptr& failure, const char* incomplete) {
+        for (std::size_t i = 0; i < futures.size(); ++i) {
+            MigrationResult result;
+            try {
+                result = futures[i].get();
+            } catch (...) {
+                if (!failure)
+                    failure = std::current_exception();
+            }
+            lock.lock();
+            if (result.committed) {
+                discard_prefetch(entries[victims[i]]);
+                remove(victims[i]);
+                ++counters.demotions;
+            }
+            lock.unlock();
+            if (!failure && result.error)
+                failure = result.error;
+            if (!failure && (!result.committed || result.cleanup_pending))
+                failure = std::make_exception_ptr(StorageBusy(incomplete));
+        }
+        lock.lock();
+        for (std::size_t i = 0; i < count; ++i)
+            entries[victims[i]].busy = false;
+        changed.notify_all();
+    }
     void discard_prefetch(Entry& entry) noexcept {
         if (entry.prefetched) {
             ++counters.prefetch_unused;
@@ -523,30 +555,7 @@ void KVOffloadCache::Impl::make_room_for_batch(const std::vector<std::size_t>& s
         } catch (...) {
             failure = std::current_exception();
         }
-        for (std::size_t i = 0; i < futures.size(); ++i) {
-            MigrationResult result;
-            try {
-                result = futures[i].get();
-            } catch (...) {
-                if (!failure)
-                    failure = std::current_exception();
-            }
-            lock.lock();
-            if (result.committed) {
-                discard_prefetch(entries[victims[i]]);
-                remove(victims[i]);
-                ++counters.demotions;
-            }
-            lock.unlock();
-            if (!failure && result.error)
-                failure = result.error;
-            if (!failure && (!result.committed || result.cleanup_pending))
-                failure = std::make_exception_ptr(StorageBusy("Batch demotion incomplete"));
-        }
-        lock.lock();
-        for (std::size_t i = 0; i < count; ++i)
-            entries[victims[i]].busy = false;
-        changed.notify_all();
+        finish_demotions(lock, victims, count, futures, failure, "Batch demotion incomplete");
         if (failure)
             std::rethrow_exception(failure);
         needed -= count;
@@ -605,32 +614,7 @@ void KVOffloadCache::Impl::write_overlapped(const std::vector<std::size_t>& slot
         } catch (...) {
             failure = std::current_exception();
         }
-        // Drain every accepted migration even if launch or foreground writes
-        // fail. Source entries stay busy until their actual result is consumed.
-        for (std::size_t i = 0; i < futures.size(); ++i) {
-            MigrationResult result;
-            try {
-                result = futures[i].get();
-            } catch (...) {
-                if (!failure)
-                    failure = std::current_exception();
-            }
-            lock.lock();
-            if (result.committed) {
-                discard_prefetch(entries[victims[i]]);
-                remove(victims[i]);
-                ++counters.demotions;
-            }
-            lock.unlock();
-            if (!failure && result.error)
-                failure = result.error;
-            if (!failure && (!result.committed || result.cleanup_pending))
-                failure = std::make_exception_ptr(StorageBusy("Overlapped demotion incomplete"));
-        }
-        lock.lock();
-        for (std::size_t i = 0; i < count; ++i)
-            entries[victims[i]].busy = false;
-        changed.notify_all();
+        finish_demotions(lock, victims, count, futures, failure, "Overlapped demotion incomplete");
         lock.unlock();
         if (failure)
             std::rethrow_exception(failure);

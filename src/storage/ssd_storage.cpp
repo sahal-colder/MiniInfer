@@ -241,7 +241,6 @@ struct SSDStorageBackend::Impl {
         bool released = false;
         BlockMeta meta;
     };
-    int fd = -1;
     std::array<int, 4> files{{-1, -1, -1, -1}};
     std::size_t file_count = 1;
     std::string pending_file;
@@ -278,7 +277,7 @@ struct SSDStorageBackend::Impl {
                 lane.reset();
         }
         io.reset(); // Drain async calls and release registered files before closing fd.
-        if (fd >= 0) {
+        if (files[0] >= 0) {
             for (auto file : files)
                 if (file >= 0)
                     ::close(file);
@@ -599,7 +598,6 @@ SSDStorageBackend::SSDStorageBackend(std::size_t bytes, std::size_t budget,
         if (file < 0)
             io_error("SSD private temporary file");
         state->files[i] = file;
-        state->fd = state->files[0];
         if (::fchmod(file, 0600) != 0)
             io_error("SSD private file mode");
         const auto slots =
@@ -614,7 +612,7 @@ SSDStorageBackend::SSDStorageBackend(std::size_t bytes, std::size_t budget,
             io_error("SSD unlink temporary file");
         state->pending_file.clear();
     }
-    state->io = std::make_unique<FileIO>(io, state->fd);
+    state->io = std::make_unique<FileIO>(io, state->files[0]);
     impl_ = std::move(state);
 }
 SSDStorageBackend::SSDStorageBackend(std::size_t bytes, std::size_t budget,
@@ -1039,7 +1037,7 @@ void SSDStorageBackend::read_validated_many(const std::vector<StorageRead>& requ
                                 requests[i].expected.size);
         return;
     } else
-        impl_->io->read_many(impl_->fd, ranges);
+        impl_->io->read_many(impl_->files[0], ranges);
     for (const auto& request : requests)
         impl_->read_bytes.fetch_add(request.expected.size, std::memory_order_relaxed);
     const auto verify = [&](std::size_t i) {
