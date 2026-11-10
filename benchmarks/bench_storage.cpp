@@ -11,6 +11,7 @@
 #include <numeric>
 #include <random>
 #include <system_error>
+#include <sys/resource.h>
 #include <unistd.h>
 
 namespace {
@@ -21,6 +22,9 @@ struct File {
     int descriptor = -1;
     ~File() { if (descriptor >= 0) close(descriptor); }
 };
+double seconds(timeval value) {
+    return value.tv_sec + value.tv_usec / 1e6;
+}
 }
 
 int main(int argc, char** argv) {
@@ -136,21 +140,27 @@ int main(int argc, char** argv) {
         }
         if (posix) require(fsync(file.descriptor) == 0, "initialization fsync");
         std::ofstream out(args.at("output") + ".csv");
-        out << "backend,operation,round,block_bytes,dataset_bytes,requested_depth,effective_depth,pattern,seconds,GB_s,IOPS,operations,device_completions,setup_flags\n";
+        out << "backend,operation,round,block_bytes,dataset_bytes,requested_depth,effective_depth,pattern,seconds,GB_s,IOPS,operations,device_completions,setup_flags,cpu_user_seconds,cpu_system_seconds\n";
         out << std::setprecision(12);
         for (std::size_t round = 0; round < rounds; ++round) {
             // Alternate order to reduce a fixed write-before-read bias.
             for (bool write : {bool(round % 2), !bool(round % 2)}) {
                 const auto before = device ? device->stats().completed_ios : 0;
                 double seconds = 0;
+                double user_seconds = 0, system_seconds = 0;
                 for (std::size_t i = 0; i < order.size(); i += depth) {
                     std::vector<infer::FileIORequest> requests;
                     for (std::size_t j = i; j < std::min(i + depth, order.size()); ++j)
                         requests.push_back({write ? source + order[j] * block : target + (j - i) * block,
                                             block, order[j] * block});
+                    rusage cpu_before{}, cpu_after{};
+                    require(getrusage(RUSAGE_SELF, &cpu_before) == 0, "getrusage");
                     const auto start = bench::Clock::now();
                     transfer(write, requests);
                     seconds += bench::seconds(start);
+                    require(getrusage(RUSAGE_SELF, &cpu_after) == 0, "getrusage");
+                    user_seconds += ::seconds(cpu_after.ru_utime) - ::seconds(cpu_before.ru_utime);
+                    system_seconds += ::seconds(cpu_after.ru_stime) - ::seconds(cpu_before.ru_stime);
                     if (!write)
                         for (std::size_t j = 0; j < requests.size(); ++j)
                             if (std::memcmp(requests[j].data, source + requests[j].offset, block))
@@ -162,7 +172,7 @@ int main(int argc, char** argv) {
                     << args.at("pattern") << ',' << seconds << ',' << bytes / seconds / 1e9 << ','
                     << order.size() / seconds << ',' << order.size() << ','
                     << (device ? std::to_string(device->stats().completed_ios - before) : "") << ','
-                    << io.setup_flags << '\n';
+                    << io.setup_flags << ',' << user_seconds << ',' << system_seconds << '\n';
             }
         }
         if (!out) throw std::runtime_error("Cannot write storage results");

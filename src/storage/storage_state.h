@@ -164,7 +164,21 @@ std::vector<LogicalBlockRecord*> prepare_batch(StorageState& state, const std::v
 void cancel_prepared(StorageState& state, LogicalBlockRecord& record) noexcept;
 MigrationResult execute_transfer(StorageState& state, LogicalBlockRecord& record,
                                  bool* quarantined = nullptr);
-std::size_t execute_chunk_batch(StorageState& state, const std::vector<LogicalBlockRecord*>& records,
+#if INFER_ENABLE_CUDA
+struct GPUMigrationBatch {
+    struct Copy {
+        void* device;
+        void* host;
+        std::size_t bytes;
+    };
+
+    // Storage owns every source and destination until their migration commits or rolls back.
+    static std::exception_ptr copy(GPUStorageBackend& backend, const Copy* copies,
+                                   std::size_t count, bool to_gpu, std::size_t& submitted,
+                                   bool& completion_unknown);
+};
+#endif
+std::size_t execute_batch_group(StorageState& state, const std::vector<LogicalBlockRecord*>& records,
                                 std::vector<MigrationResult>& results, std::size_t first,
                                 bool& quarantined);
 class MigrationExecutor {

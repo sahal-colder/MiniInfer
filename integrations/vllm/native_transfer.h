@@ -59,6 +59,7 @@ class NativeTransfer {
         std::mutex mutex;
         std::array<Event, 2> events;
         std::array<bool, 2> used{{false, false}};
+        bool completion_unknown = false;
         std::vector<CUdeviceptr> src, dst;
         std::vector<std::size_t> lengths, indices;
         std::vector<void*> buffers;
@@ -203,6 +204,10 @@ class NativeTransfer {
         auto& state = directions_[write];
         std::lock_guard<std::mutex> lock(state.mutex);
         Context context(context_);
+        if (state.completion_unknown) {
+            check(cuStreamSynchronize(streams_[write]), "Recover transfer completion");
+            state.completion_unknown = false;
+        }
         std::uint64_t pending = 0;
         const auto io = [&](std::size_t begin, std::size_t group) {
             const auto n = std::min(half_, count - begin);
@@ -266,7 +271,7 @@ class NativeTransfer {
             if (pending) {
                 try { queue_.wait(pending); } catch (...) {}
             }
-            cuStreamSynchronize(streams_[write]);
+            state.completion_unknown = cuStreamSynchronize(streams_[write]) != CUDA_SUCCESS;
             throw;
         }
     }

@@ -47,7 +47,7 @@ struct Job {
     LayerRead read;
     const std::byte* key = nullptr;
     const std::byte* value = nullptr;
-    std::size_t position = 0, count = 1, row_bytes = 0;
+    std::size_t position = 0, count = 1;
 };
 
 struct Done {
@@ -57,7 +57,7 @@ struct Done {
 
 class LayerIO {
   public:
-    LayerIO(const AsyncKVPipeline::Read& read, const AsyncKVPipeline::Write& write)
+    LayerIO(const AsyncKVPipeline::Read& read, const AsyncKVPipeline::WriteRows& write)
         : read_(read), write_(write) {
         if (sem_init(&wake_, 0, 0) != 0)
             throw std::system_error(errno, std::generic_category(), "initialize KV I/O semaphore");
@@ -105,10 +105,7 @@ class LayerIO {
             }
             Done done{{job.read.generation, job.read.layer, {}}, job.key != nullptr};
             try {
-                if (done.write) {
-                    for (std::size_t row=0;row<job.count;++row)
-                        write_(job.read.layer, job.position+row, job.key+row*job.row_bytes, job.value+row*job.row_bytes);
-                }
+                if (done.write) write_(job.read.layer, job.position, job.count, job.key, job.value);
                 else read_(job.read);
             } catch (...) {
                 done.read.error = std::current_exception();
@@ -119,7 +116,7 @@ class LayerIO {
 
     // Impl owns callbacks until this worker has drained and joined.
     const AsyncKVPipeline::Read& read_;
-    const AsyncKVPipeline::Write& write_;
+    const AsyncKVPipeline::WriteRows& write_;
     Ring<Job> requests_;
     Ring<Done> completions_;
     unsigned outstanding_ = 0;
@@ -167,7 +164,7 @@ struct AsyncKVPipeline::Impl {
     cudaStream_t compute_stream_{}, prefetch_h2d_stream_{}, offload_d2h_stream_{};
     std::vector<Slot> slots;
     Read read;
-    Write write;
+    WriteRows write;
     bool resident_initialized = false;
     std::size_t dirty_begin = 0, count = 1;
     std::array<cudaEvent_t, 3> retirement{};
@@ -185,7 +182,7 @@ struct AsyncKVPipeline::Impl {
         return {compute_stream_, prefetch_h2d_stream_, offload_d2h_stream_};
     }
 
-    void initialize(Read reader, Write writer) {
+    void initialize(Read reader, WriteRows writer) {
         read = std::move(reader); write = std::move(writer);
         const auto plane_bytes = multiply(config.tokens_per_page, config.row_bytes);
         if (!config.layers || !config.max_pages || !plane_bytes ||
@@ -194,7 +191,7 @@ struct AsyncKVPipeline::Impl {
             throw std::invalid_argument("invalid KV pipeline configuration");
         const auto page_capacity = multiply(config.max_pages, config.page_bytes);
         const auto table_bytes = multiply(config.max_pages, sizeof(void*));
-        const auto output_bytes = multiply(2, multiply(config.max_pages, plane_bytes));
+        const auto output_bytes = config.gpu_resident ? 0 : multiply(2, multiply(config.max_pages, plane_bytes));
         if (table_bytes > SIZE_MAX - page_capacity)
             throw std::length_error("KV pipeline slot overflow");
         const auto slot_bytes = page_capacity + table_bytes;
@@ -206,32 +203,44 @@ struct AsyncKVPipeline::Impl {
         const auto capacity = multiply(slots.size(), slot_capacity);
         if (config.max_device_bytes && capacity > config.max_device_bytes)
             throw std::length_error("async KV GPU budget must hold two max-context slots and page tables");
-        // Reserve enough cache for both rounded allocations to retire by event.
+        // These fixed-size slots live until retirement. Slab tails would be
+        // stranded against the hard budget when a slot does not divide a slab.
+        pool_config.min_split_bytes = 0;
         pool_config.max_reserved_bytes = capacity;
         pool_config.max_cached_bytes = capacity;
         pool = std::make_unique<CachingCUDADeviceAllocator>(pool_config);
         check_cuda(cudaSetDevice(config.device), "select KV pipeline device");
-        for (auto* stream : {&compute_stream_, &prefetch_h2d_stream_, &offload_d2h_stream_})
+        for (auto* stream : {&compute_stream_, &offload_d2h_stream_})
             check_cuda(cudaStreamCreateWithFlags(stream, cudaStreamNonBlocking), "create KV stream");
-        for (auto& event : retirement) create_event(event);
+        if (!config.gpu_resident)
+            check_cuda(cudaStreamCreateWithFlags(&prefetch_h2d_stream_, cudaStreamNonBlocking),
+                       "create KV prefetch stream");
+        const auto handles = streams();
+        for (std::size_t i = 0; i < handles.size(); ++i)
+            if (handles[i]) create_event(retirement[i]);
         create_event(output_produced);
         create_event(output_ready);
         pool->register_stream(compute_stream_);
         registered = true;
         for (auto& slot : slots) {
-            create_event(slot.ready);
-            create_event(slot.compute_done);
-            create_event(slot.reusable);
+            if (!config.gpu_resident) {
+                create_event(slot.ready);
+                create_event(slot.compute_done);
+                create_event(slot.reusable);
+            }
             slot.device = static_cast<std::byte*>(pool->allocate(slot_bytes, compute_stream_));
             slot.input = static_cast<std::byte*>(pinned.allocate(slot_bytes));
-            slot.output = static_cast<std::byte*>(pinned.allocate(output_bytes));
+            // Resident D2H waits for compute, which follows prefix H2D. The
+            // host input can be reused for writeback until the next retirement.
+            slot.output = config.gpu_resident ? slot.input :
+                static_cast<std::byte*>(pinned.allocate(output_bytes));
             slot.table = reinterpret_cast<const float**>(slot.device + page_capacity);
             auto** host = reinterpret_cast<const float**>(slot.input + page_capacity);
             for (std::size_t page = 0; page < config.max_pages; ++page)
                 host[page] = reinterpret_cast<const float*>(slot.device + page * config.page_bytes);
             check_cuda(cudaMemcpyAsync(slot.table, host, table_bytes, cudaMemcpyHostToDevice,
-                                       prefetch_h2d_stream_), "initialize KV page table");
-            check_cuda(cudaEventRecord(slot.ready, prefetch_h2d_stream_), "initialize table fence");
+                                       config.gpu_resident ? compute_stream_ : prefetch_h2d_stream_),
+                       "initialize KV page table");
         }
         device_bytes = pool->stats().reserved_bytes;
         if (!config.gpu_resident) io = std::make_unique<LayerIO>(read, write);
@@ -258,7 +267,7 @@ struct AsyncKVPipeline::Impl {
                 slot.in_state = Input::Free;
             if (slot.out_state != Output::Downloading || !completed(slot.reusable)) continue;
             if (io->try_submit({{generation, slot.out_layer, pages, nullptr},
-                                slot.output, slot.output + count * config.row_bytes, position, count, config.row_bytes}))
+                                slot.output, slot.output + count * config.row_bytes, position, count}))
                 slot.out_state = Output::Writing;
         }
     }
@@ -333,13 +342,10 @@ struct AsyncKVPipeline::Impl {
     void resident_compute(const Compute& compute) {
         for (std::size_t layer=0;layer<config.layers;++layer) {
             auto& slot=slots[layer];
-            if (!resident_initialized) {
-                check_cuda(cudaStreamWaitEvent(compute_stream_,slot.ready,0), "wait for resident table");
-                if (position) {
-                    read({generation,layer,pages,slot.input});
-                    check_cuda(cudaMemcpyAsync(slot.device,slot.input,pages*config.page_bytes,
-                        cudaMemcpyHostToDevice,compute_stream_), "restore resident prefix");
-                }
+            if (!resident_initialized && position) {
+                read({generation,layer,pages,slot.input});
+                check_cuda(cudaMemcpyAsync(slot.device,slot.input,pages*config.page_bytes,
+                    cudaMemcpyHostToDevice,compute_stream_), "restore resident prefix");
             }
             compute(layer, layer_view(slot, position), compute_stream_);
         }
@@ -350,19 +356,26 @@ struct AsyncKVPipeline::Impl {
 
     void flush_resident() {
         if (!config.gpu_resident || !resident_initialized) return;
-        if (phase != Phase::Idle) throw std::logic_error("resident writeback requires completed admission");
+        if (phase != Phase::Idle || downloading)
+            throw std::logic_error("resident writeback requires completed admission and output");
         const auto rows=position+count-dirty_begin;
         if (!rows) return;
-        check_cuda(cudaEventRecord(output_produced,compute_stream_), "resident flush producer");
-        check_cuda(cudaStreamWaitEvent(offload_d2h_stream_,output_produced,0), "resident flush dependency");
-        for (auto& slot:slots) download_rows(slot,dirty_begin,rows);
-        check_cuda(cudaEventRecord(output_ready,offload_d2h_stream_), "resident flush completion");
-        while (!completed(output_ready)) std::this_thread::yield();
-        for (std::size_t layer=0;layer<config.layers;++layer)
-            for (std::size_t row=0;row<rows;++row)
-                write(layer,dirty_begin+row,slots[layer].output+row*config.row_bytes,
-                    slots[layer].output+(rows+row)*config.row_bytes);
-        dirty_begin=position+count;
+        try {
+            check_cuda(cudaEventRecord(output_produced,compute_stream_), "resident flush producer");
+            check_cuda(cudaStreamWaitEvent(offload_d2h_stream_,output_produced,0), "resident flush dependency");
+            for (auto& slot:slots) download_rows(slot,dirty_begin,rows);
+            check_cuda(cudaEventRecord(output_ready,offload_d2h_stream_), "resident flush completion");
+            while (!completed(output_ready)) std::this_thread::yield();
+            for (std::size_t layer = 0; layer < config.layers; ++layer)
+                write(layer, dirty_begin, rows, slots[layer].output,
+                      slots[layer].output + rows * config.row_bytes);
+            dirty_begin=position+count;
+        } catch (...) {
+            // A failed flush may already have queued D2H or written some layers.
+            // Retire that work before admitting kernels that reuse these slots.
+            phase = Phase::Failed;
+            throw;
+        }
     }
 
     void begin_retire() {
@@ -401,8 +414,8 @@ struct AsyncKVPipeline::Impl {
                 pool->release(slot.device, compute_stream_);
                 slot.device = nullptr;
             }
+            if (slot.output && slot.output != slot.input) pinned.release(slot.output);
             if (slot.input) pinned.release(slot.input);
-            if (slot.output) pinned.release(slot.output);
             for (auto event : {slot.ready, slot.compute_done, slot.reusable})
                 if (event) cudaEventDestroy(event);
         }
@@ -434,6 +447,15 @@ struct AsyncKVPipeline::Impl {
 };
 
 AsyncKVPipeline::AsyncKVPipeline(Config config, Read read, Write write)
+    : AsyncKVPipeline(config, std::move(read),
+          write ? WriteRows([write = std::move(write), bytes = config.row_bytes](
+                                std::size_t layer, std::size_t position, std::size_t count,
+                                const std::byte* key, const std::byte* value) {
+              for (std::size_t row = 0; row < count; ++row)
+                  write(layer, position + row, key + row * bytes, value + row * bytes);
+          }) : WriteRows{}) {}
+
+AsyncKVPipeline::AsyncKVPipeline(Config config, Read read, WriteRows write)
     : impl_(std::make_unique<Impl>(config)) {
     try {
         impl_->initialize(std::move(read), std::move(write));
@@ -452,6 +474,8 @@ void AsyncKVPipeline::begin_token(std::size_t position, std::size_t count) {
     if (!count || position >= s.config.max_pages*s.config.tokens_per_page ||
         count > s.config.max_pages*s.config.tokens_per_page-position)
         throw std::out_of_range("KV pipeline context is full");
+    if (s.resident_initialized && position != s.position + s.count)
+        throw std::logic_error("Resident KV admissions must be contiguous");
     s.position = position;
     s.count = count;
     s.pages = (position+count-1) / s.config.tokens_per_page + 1;
@@ -512,7 +536,13 @@ void AsyncKVPipeline::download(void* pinned, const void* device, std::size_t byt
 
 bool AsyncKVPipeline::poll_download() {
     auto& s = *impl_;
-    if (s.downloading && !completed(s.output_ready)) return false;
+    if (s.phase != Impl::Phase::Idle) throw std::logic_error("KV output must finish or retire first");
+    try {
+        if (s.downloading && !completed(s.output_ready)) return false;
+    } catch (...) {
+        s.phase = Impl::Phase::Failed;
+        throw;
+    }
     s.downloading = false;
     return true;
 }

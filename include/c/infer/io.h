@@ -56,7 +56,8 @@ typedef enum if_io_backend {
 
 /* Explicit selection never falls back to another backend. A backend omitted
  * from the build returns -ENOTSUP. Open failure leaves *out NULL and fd owned
- * by the caller. Legacy open functions select POSIX. */
+ * by the caller. Adopted writable descriptors must remain free of O_APPEND.
+ * Legacy open functions select POSIX. */
 IF_API int if_dev_open_tmp_backend(if_io_backend backend, const char *dir, uint64_t size, if_dev **out);
 IF_API int if_dev_open_fd_backend(if_io_backend backend, int fd, uint64_t size, int own, if_dev **out);
 

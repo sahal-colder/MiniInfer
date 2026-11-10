@@ -1,5 +1,6 @@
 /* Device contract: validate the complete batch before entering any backend. */
 #include "internal.h"
+#include <fcntl.h>
 #include <limits.h>
 
 static int validate(const if_dev *d, const if_io *v, size_t n) {
@@ -63,6 +64,17 @@ static if_file_opener opener(if_io_backend backend) {
     }
 }
 
+static int validate_positional_fd(int fd) {
+    int flags;
+    do {
+        flags = fcntl(fd, F_GETFL);
+    } while (flags < 0 && errno == EINTR);
+    if (flags < 0)
+        return -errno;
+    /* Linux can append positional writes when O_APPEND is set. */
+    return (flags & O_APPEND) && (flags & O_ACCMODE) != O_RDONLY ? -EINVAL : 0;
+}
+
 int if_dev_open_fd_backend(if_io_backend backend, int fd, uint64_t size, int own, if_dev **out) {
     if (!out)
         return -EINVAL;
@@ -75,7 +87,9 @@ int if_dev_open_fd_backend(if_io_backend backend, int fd, uint64_t size, int own
     if (!open_fd)
         return -ENOTSUP;
     int saved = errno;
-    int rc = open_fd(fd, size, own, out);
+    int rc = validate_positional_fd(fd);
+    if (!rc)
+        rc = open_fd(fd, size, own, out);
     errno = saved;
     return rc;
 }
@@ -112,7 +126,9 @@ int if_dev_open_uring_fd(int fd, uint64_t size, int own, unsigned depth,
         return -EFBIG;
 #ifdef IF_HAVE_URING
     int saved = errno;
-    int rc = if_uring_open_configured(fd, size, own, depth, buffers, count, out);
+    int rc = validate_positional_fd(fd);
+    if (!rc)
+        rc = if_uring_open_configured(fd, size, own, depth, buffers, count, out);
     errno = saved;
     return rc;
 #else

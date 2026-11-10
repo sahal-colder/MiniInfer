@@ -8,8 +8,8 @@ struct CUDAGraphStats {
     std::uint64_t replays = 0;
 };
 
-// Per-layer, per-slot graphs share scratch and must execute serially on the
-// pipeline's compute stream. The pipeline, blocks and weights must outlive us.
+// Each layer captures its fixed KV slot. Graphs share scratch and execute
+// serially on the pipeline's compute stream. The pipeline and weights outlive us.
 class CUDAGraphRunner {
   public:
     CUDAGraphRunner(const ModelConfig& config,

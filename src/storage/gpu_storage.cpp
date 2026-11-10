@@ -1,6 +1,5 @@
 #include "infer/cuda/cuda_memory_pool.h"
-#include "infer/storage/storage_backend.h"
-#include "slot_table.h"
+#include "storage_state.h"
 #include "scope_exit.h"
 
 #include <cstdio>
@@ -78,6 +77,16 @@ struct GPUStorageBackend::Impl {
         if (!bytes)
             return;
         auto* device_ptr = static_cast<unsigned char*>(allocation->data) + offset;
+        copy_with_event(allocation->completion_unknown, [&] {
+            check_cuda(cudaMemcpyAsync(to_gpu ? device_ptr : host, to_gpu ? host : device_ptr,
+                                       bytes,
+                                       to_gpu ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost,
+                                       transfer_stream), "storage DMA");
+        });
+    }
+
+    template <class Submit>
+    void copy_with_event(bool& completion_unknown, Submit submit) {
         std::size_t index = 0;
         cudaEvent_t completed = nullptr;
         {
@@ -92,23 +101,42 @@ struct GPUStorageBackend::Impl {
             completed = events[index].event;
             events[index].busy = true;
         }
-        // allocation->mutex is held; completion_unknown is always accessed under it.
-        allocation->completion_unknown = true;
+        completion_unknown = true;
         storage_detail::ScopeExit complete([&] {
             std::lock_guard<std::mutex> lock(mutex);
             events[index].busy = false;
-            events[index].failed = allocation->completion_unknown;
+            events[index].failed = completion_unknown;
         });
-        check_cuda(cudaMemcpyAsync(to_gpu ? device_ptr : host, to_gpu ? host : device_ptr,
-                                       bytes,
-                                       to_gpu ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost,
-                                       transfer_stream),
-                       "storage DMA");
+        submit();
         check_cuda(cudaEventRecord(completed, transfer_stream), "storage copy record");
         check_cuda(cudaEventSynchronize(completed), "storage copy completion");
-        allocation->completion_unknown = false;
+        completion_unknown = false;
     }
 };
+std::exception_ptr storage_detail::GPUMigrationBatch::copy(
+    GPUStorageBackend& backend, const Copy* copies, std::size_t count, bool to_gpu,
+    std::size_t& submitted, bool& completion_unknown) {
+    auto& state = *backend.impl_;
+    DeviceScope scope(state.device);
+    std::exception_ptr submission_error;
+    state.copy_with_event(completion_unknown, [&] {
+        try {
+            for (; submitted < count; ++submitted) {
+                const auto& copy = copies[submitted];
+                require_pinned(copy.host, copy.bytes);
+                check_cuda(cudaMemcpyAsync(to_gpu ? copy.device : copy.host,
+                                           to_gpu ? copy.host : copy.device, copy.bytes,
+                                           to_gpu ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost,
+                                           state.transfer_stream), "storage batch DMA");
+            }
+        } catch (...) {
+            // Fence the accepted DMA even when a later submission fails.
+            submission_error = std::current_exception();
+        }
+    });
+    return submission_error;
+}
+
 GPUStorageBackend::GPUStorageBackend(std::size_t bytes, std::size_t budget, int device) {
     storage_detail::validate_slot_bytes(bytes);
     if (budget < bytes || device < 0)

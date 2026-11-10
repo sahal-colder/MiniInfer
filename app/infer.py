@@ -11,6 +11,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+MEMORY_MODES = ("sync", "async", "pool")
+SPDK_OPTIONS = ("config", "bdev", "reactor-mask", "mem-mib", "iova-mode",
+                "no-huge", "no-pci", "chunk-kib")
 DEFAULTS = {
     "framework": "native", "storage-engine": "posix", "memory-mode": "pool",
     "cuda": True, "device": "cuda", "c-api": True, "preload": True,
@@ -89,7 +92,7 @@ def validate(config, *, building):
     for key, choices in (
         ("framework", ("native", "vllm", "storage")),
         ("storage-engine", ("posix", "uring", "auto", "spdk")),
-        ("memory-mode", ("sync", "async", "pool")),
+        ("memory-mode", MEMORY_MODES),
         ("device", ("cpu", "cuda")),
         ("build-type", ("Release", "Debug", "RelWithDebInfo", "MinSizeRel")),
         ("ssd-verify", ("on_read", "read_back")),
@@ -145,7 +148,7 @@ def build_plan(config):
         "INFER_BUILD_VLLM": framework == "vllm",
         "INFER_BUILD_C_API": config["c-api"],
         "INFER_BUILD_PRELOAD": config["preload"],
-        "INFER_MEMORY_MODE": ("sync", "async", "pool").index(config["memory-mode"]),
+        "INFER_MEMORY_MODE": MEMORY_MODES.index(config["memory-mode"]),
         "INFER_ENABLE_SPDK": config["storage-engine"] == "spdk",
         "INFER_ENABLE_IO_URING": framework == "native" or config["storage-engine"] in ("uring", "auto"),
         "INFER_ENABLE_CUFILE": config["cufile"],
@@ -183,8 +186,7 @@ def run_plan(config):
         keys = ["storage-engine", "gpu-cache-bytes", "cpu-cache-bytes", "ssd-bytes",
                 "ssd-directory", "io-depth", "file-shards", "ssd-verify"]
         if config["storage-engine"] == "spdk":
-            keys += [f"spdk-{key}" for key in
-                     ("config", "bdev", "reactor-mask", "mem-mib", "iova-mode", "no-huge", "no-pci", "chunk-kib")]
+            keys.extend(f"spdk-{key}" for key in SPDK_OPTIONS)
         for key in keys:
             value = int(config[key]) if type(config[key]) is bool else config[key]
             command.extend([f"--{key}", str(value)])
@@ -200,7 +202,7 @@ def run_plan(config):
         "MINIINFER_SSD_VERIFY": config["ssd-verify"],
     }
     if engine == "spdk":
-        for key in ("config", "bdev", "reactor-mask", "mem-mib", "iova-mode", "no-huge", "no-pci", "chunk-kib"):
+        for key in SPDK_OPTIONS:
             value = config[f"spdk-{key}"]
             if type(value) is bool:
                 value = int(value)
@@ -244,7 +246,7 @@ def check_build(config):
     for key, expected in (
         (f"INFER_BUILD_{config['framework'].upper()}", "ON"),
         ("INFER_ENABLE_CUDA", "ON" if config["cuda"] else "OFF"),
-        ("INFER_MEMORY_MODE", str(("sync", "async", "pool").index(config["memory-mode"]))),
+        ("INFER_MEMORY_MODE", str(MEMORY_MODES.index(config["memory-mode"]))),
     ):
         if cache.get(key) != expected:
             raise ValueError(f"build does not match {key}={expected}; rebuild with the current config")
@@ -276,8 +278,8 @@ def run(config, plan):
     Path(config["ssd-directory"]).mkdir(parents=True, exist_ok=True)
     from importlib.metadata import version
 
-    if version("vllm") != "0.31.0":
-        raise ValueError("vLLM integration requires the tested vllm==0.31.0")
+    if version("vllm") not in ("0.31.0", "0.32.0"):
+        raise ValueError("vLLM integration requires vLLM 0.31.0 or 0.32.0")
     from vllm import LLM, SamplingParams
 
     llm = LLM(**plan["llm"])

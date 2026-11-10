@@ -5,15 +5,17 @@ def pool_allocation_bytes(size):
     """Existing cpu_detail::size_class rule (also used by the Pinned pool)."""
     if type(size) is not int or not 0 < size <= (1 << 64) - 64:
         raise ValueError("Invalid host allocation size")
-    step = 64 if size <= 1024 else 1 << ((size - 1).bit_length() - 3)
-    return (size + step - 1) // step * step
+    step = 64 if size <= 4096 else 1 << ((size - 1).bit_length() - 7)
+    return min((size + step - 1) // step * step, (1 << 64) - 64)
 
 
 def pool_usable_budget(total):
     pool_allocation_bytes(total)  # Validate before shifting.
-    if total <= 1024:
+    if total == (1 << 64) - 64:
+        return total
+    if total <= 4096:
         return total // 64 * 64
-    step = 1 << (total.bit_length() - 3)
+    step = 1 << (total.bit_length() - 7)
     return total // step * step
 
 

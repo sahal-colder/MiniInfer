@@ -58,7 +58,7 @@ struct MigrationExecutor::Impl {
         bool quarantined = false;
         for (std::size_t i = 0; i < batch.records.size();) {
             if (!quarantined) {
-                const auto end = execute_chunk_batch(*state, batch.records, batch.results, i, quarantined);
+                const auto end = execute_batch_group(*state, batch.records, batch.results, i, quarantined);
                 if (end != i) {
                     i = end;
                     continue;

@@ -1,6 +1,0 @@
-include_guard(GLOBAL)
-find_package(CUDAToolkit REQUIRED)
-if(NOT UNIX)
-    message(FATAL_ERROR "MiniInfer's existing mmap loader requires POSIX. Use Linux or WSL.")
-endif()
-message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES} (override with -DCMAKE_CUDA_ARCHITECTURES=...)")

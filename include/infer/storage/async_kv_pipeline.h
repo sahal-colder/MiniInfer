@@ -41,13 +41,18 @@ class AsyncKVPipeline {
     using Read = std::function<void(const LayerRead&)>;
     using Write = std::function<void(std::size_t layer, std::size_t position,
                                      const std::byte* key, const std::byte* value)>;
+    // Key and value each point to count contiguous rows of config.row_bytes.
+    using WriteRows = std::function<void(std::size_t layer, std::size_t position, std::size_t count,
+                                         const std::byte* key, const std::byte* value)>;
     using Compute = std::function<void(std::size_t layer, LayerView, cudaStream_t)>;
 
     AsyncKVPipeline(Config config, Read read, Write write);
+    AsyncKVPipeline(Config config, Read read, WriteRows write);
     ~AsyncKVPipeline();
     AsyncKVPipeline(const AsyncKVPipeline&) = delete;
     AsyncKVPipeline& operator=(const AsyncKVPipeline&) = delete;
 
+    // Resident admissions must append contiguously until retirement.
     void begin_token(std::size_t position, std::size_t count = 1);
     // Streaming mode completes KV writebacks. Resident mode queues kernels on
     // compute_stream; download/retirement fence them, flush_resident persists KV.

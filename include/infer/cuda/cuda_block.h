@@ -81,7 +81,7 @@ unsigned free_bin(std::size_t bytes);
 void add_bin(Bins& bins, Block& block) noexcept;
 void remove_bin(Bins& bins, Block& block) noexcept;
 
-// 保留原策略：从请求桶向上检查每桶头块，按 split 或允许浪费量决定是否复用。
+// 保留原策略：从请求桶向上扫描桶内候选块，按 split 或允许浪费量决定是否复用。
 Block* find(Bins& bins, unsigned bin, std::size_t capacity,
             const CachingCUDAAllocatorConfig& config);
 

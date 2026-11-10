@@ -8,7 +8,7 @@ namespace infer {
 struct CachingCPUAllocatorConfig {
     // 中央池 + 所有线程空闲链表的总上限，不限制 active 内存；0 禁用缓存。
     std::size_t max_cached_bytes = 64ULL * 1024 * 1024;
-    // 跨桶借用的余量还必须 <= 请求桶容量的 50%。
+    // 跨桶借用的余量还必须 <= 请求桶容量的 1/256。
     std::size_t max_reuse_waste = 1ULL * 1024 * 1024;
     bool enable_thread_cache = true;
     // <= 4 KiB 才进入 TLS；一次交换已有块，不预分配 batch 个上游块。

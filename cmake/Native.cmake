@@ -1,5 +1,6 @@
 option(MINI_INFER_USE_ARMADILLO "Use Armadillo for CPU Sgemv and SwiGLU" ON)
 option(MINI_INFER_BUILD_APP "Build the inference CLI" ON)
+option(INFER_BUILD_MODEL_BENCHMARK "Build independent model storage/KV benchmark driver" OFF)
 
 # 保留两个原有 target 及其链接关系；供 add_subdirectory 和安装包复用。
 add_library(mini_infer_memory
@@ -125,14 +126,11 @@ if(MINI_INFER_BUILD_APP)
     install(TARGETS mini_infer_main RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
+if(INFER_BUILD_MODEL_BENCHMARK OR INFER_BUILD_BENCHMARKS)
+    add_executable(miniinfer_model_bench app/benchmark_paged.cpp)
+    target_link_libraries(miniinfer_model_bench PRIVATE MiniInfer::mini_infer)
+endif()
 
 add_library(Infer::native ALIAS mini_infer)
 add_library(Infer::native_compute ALIAS mini_infer_compute)
 add_library(MiniInfer::native_compute ALIAS mini_infer_compute)
-
-
-option(INFER_BUILD_MODEL_BENCHMARK "Build independent model storage/KV benchmark driver" OFF)
-if(INFER_BUILD_MODEL_BENCHMARK)
-    add_executable(miniinfer_model_bench app/benchmark_paged.cpp)
-    target_link_libraries(miniinfer_model_bench PRIVATE MiniInfer::mini_infer)
-endif()

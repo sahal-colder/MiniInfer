@@ -138,7 +138,11 @@ class CachingCUDADeviceAllocator::Impl {
         } else {
             err = cudaDeviceSynchronize();
             if (err != cudaSuccess) {
-                std::fprintf(stderr, "CUDA pool cleanup sync: %s\n", cudaGetErrorString(err));
+                std::fprintf(stderr, "CUDA pool cleanup sync: %s; device storage retained\n",
+                             cudaGetErrorString(err));
+                if (previous >= 0 && previous != device)
+                    cudaSetDevice(previous);
+                return;
             }
         }
         for (auto& item : blocks_) {

@@ -103,8 +103,8 @@ class AdapterSession:
         native_torch_pinned=False,
         native_disk_torch_pinned=False,
     ):
-        if version("vllm") != "0.31.0":
-            raise RuntimeError("Allocation adapter requires tested vLLM 0.31.0")
+        if version("vllm") not in ("0.31.0", "0.32.0"):
+            raise RuntimeError("Allocation adapter requires vLLM 0.31.0 or 0.32.0")
         self.pool = pool
         self.allocations = []
         self.kv_views = []
@@ -115,7 +115,9 @@ class AdapterSession:
                 import vllm.v1.worker.gpu.attn_utils as runner
 
                 original = runner.allocate_kv_cache
-                if "buf = torch.zeros" not in inspect.getsource(original):
+                if (list(inspect.signature(original).parameters) !=
+                        ["kv_cache_config", "device", "layout", "kernel_block_sizes"] or
+                        "buf = torch.zeros" not in inspect.getsource(original)):
                     raise RuntimeError("vLLM KV allocation implementation changed")
                 gpu_allocate = clone_function(
                     original, torch=AllocationTorch(pool, "gpu", "gpu_kv", self.allocations)
@@ -142,6 +144,10 @@ class AdapterSession:
                 from vllm.v1.simple_kv_offload.worker import SimpleCPUOffloadWorker
 
                 original = SimpleCPUOffloadWorker._init_cpu_mode
+                if list(inspect.signature(original).parameters) != [
+                    "self", "unique_gpu_caches", "total_bytes_per_block", "device"
+                ]:
+                    raise RuntimeError("vLLM CPU offload allocation interface changed")
 
                 def native_init(worker, caches, total_bytes_per_block, device):
                     facade = PinnedArenaTorch(
@@ -159,10 +165,10 @@ class AdapterSession:
                 from miniinfer_connector import MiniInferDiskBackend
 
                 allocated = clone_function(
-                    MiniInferDiskBackend.init,
+                    MiniInferDiskBackend._prepare_staging,
                     torch=AllocationTorch(pool, "pinned", "staging", self.allocations),
                 )
-                self.replace(MiniInferDiskBackend, "init", allocated)
+                self.replace(MiniInferDiskBackend, "_prepare_staging", allocated)
             if native_disk_torch_pinned:
                 from vllm.v1.simple_kv_offload.disk_backend import DiskBackend
 

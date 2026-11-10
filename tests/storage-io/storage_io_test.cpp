@@ -50,6 +50,55 @@ TEST(StorageIO, AlignedCPUAllocationsCanBeReusedAndReleased) {
 }
 
 #ifdef TEST_C_DEVICE
+TEST(StorageIO, PositionalBackendsRejectAppendAndPreserveCallerOwnership) {
+    char name[] = "/tmp/infer-c-append-XXXXXX";
+    const int fd = mkstemp(name);
+    ASSERT_GE(fd, 0);
+    const auto close_fd = [](const int* p) { close(*p); };
+    const std::unique_ptr<const int, decltype(close_fd)> file(&fd, close_fd);
+    ASSERT_EQ(unlink(name), 0);
+    const int flags = fcntl(fd, F_GETFL);
+    ASSERT_GE(flags, 0);
+    ASSERT_EQ(fcntl(fd, F_SETFL, flags | O_APPEND), 0);
+    for (auto backend : {IF_IO_POSIX, IF_IO_DLSYM, IF_IO_URING}) {
+        if_dev* opened = nullptr;
+        errno = EDOM;
+        const int result = if_dev_open_fd_backend(backend, fd, 4096, 1, &opened);
+        const int caller_errno = errno;
+        const std::unique_ptr<if_dev, decltype(&if_dev_close)> dev(opened, if_dev_close);
+        ASSERT_TRUE(result == -EINVAL || (backend != IF_IO_POSIX && result == -ENOTSUP));
+        EXPECT_EQ(opened, nullptr);
+        EXPECT_EQ(caller_errno, EDOM);
+        EXPECT_EQ(fcntl(fd, F_GETFL), flags | O_APPEND);
+    }
+    if_dev* opened = nullptr;
+    const int result = if_dev_open_uring_fd(fd, 4096, 0, 4, nullptr, 0, &opened);
+    const std::unique_ptr<if_dev, decltype(&if_dev_close)> dev(opened, if_dev_close);
+    EXPECT_TRUE(result == -EINVAL || result == -ENOTSUP);
+    EXPECT_EQ(opened, nullptr);
+}
+
+TEST(StorageIO, DlsymAdapterTransfersBothSegmentsAndPreservesErrno) {
+    if_dev* opened = nullptr;
+    errno = EDOM;
+    const int status = if_dev_open_tmp_backend(IF_IO_DLSYM, "/tmp", 4096, &opened);
+    if (status == -ENOTSUP) GTEST_SKIP() << "dlsym adapter disabled";
+    ASSERT_EQ(status, 0);
+    EXPECT_EQ(errno, EDOM);
+    const std::unique_ptr<if_dev, decltype(&if_dev_close)> dev(opened, if_dev_close);
+
+    std::array<char, 3> header{'h', 'd', 'r'}, read_header{};
+    std::array<char, 4> payload{'d', 'a', 't', 'a'}, read_payload{};
+    const if_io write{header.data(), header.size(), payload.data(), payload.size(), 113};
+    const if_io read{read_header.data(), read_header.size(), read_payload.data(), read_payload.size(), 113};
+    ASSERT_EQ(if_dev_write(dev.get(), &write, 1), 0);
+    ASSERT_EQ(if_dev_flush(dev.get()), 0);
+    ASSERT_EQ(if_dev_read(dev.get(), &read, 1), 0);
+    EXPECT_EQ(read_header, header);
+    EXPECT_EQ(read_payload, payload);
+    EXPECT_EQ(errno, EDOM);
+}
+
 TEST(StorageIO, FixedBuffersMixedIovAndShortRead) {
     char name[] = "/tmp/infer-c-uring-XXXXXX";
     const int fd = mkstemp(name);

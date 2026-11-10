@@ -12,8 +12,103 @@
 
 namespace {
 std::atomic<bool> fail_writes{false};
+#if INFER_ENABLE_CUDA
+std::atomic<bool> fail_copy_wait{false}, fail_recovery_wait{false};
+
+TEST(TieredMigration, UnknownDmaKeepsBothBudgetsAndStopsTheBatchUntilRecovery) {
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) GTEST_SKIP() << "CUDA required";
+    using infer::StorageLocation;
+    infer::StorageConfig config;
+    config.block_bytes = 65536;
+    config.budget.cpu_bytes = config.budget.gpu_bytes = 2 * config.block_bytes;
+    infer::TieredStorage storage(config);
+    const std::vector<infer::BlockId> ids{storage.create(config.block_bytes),
+                                          storage.create(config.block_bytes)};
+    for (auto id : ids) {
+        auto lease = storage.acquire(id, infer::AccessMode::WRITE);
+        std::memset(lease.writable_data(), 37, lease.size());
+        lease.finish();
+    }
+    const auto version = storage.metadata(ids.front()).version;
+    fail_copy_wait = fail_recovery_wait = true;
+    const auto results = storage.migrate_batch_async(ids, StorageLocation::GPU).get();
+    EXPECT_FALSE(results[0].committed);
+    EXPECT_TRUE(results[0].cleanup_pending);
+    EXPECT_FALSE(results[1].committed);
+    EXPECT_FALSE(results[1].cleanup_pending);
+    EXPECT_EQ(storage.staging_stats().busy_slots, 1u);
+    EXPECT_EQ(storage.stats(StorageLocation::CPU).pending_cleanup_bytes, config.block_bytes);
+    EXPECT_EQ(storage.stats(StorageLocation::GPU).pending_cleanup_bytes, config.block_bytes);
+    EXPECT_EQ(storage.metadata(ids.front()).state, infer::BlockState::ERROR);
+    EXPECT_THROW(storage.acquire(ids.front()), std::logic_error);
+    EXPECT_EQ(storage.metadata(ids.back()).state, infer::BlockState::RESIDENT);
+
+    ASSERT_TRUE(storage.retry_cleanup(ids.front()));
+    EXPECT_EQ(storage.staging_stats().busy_slots, 0u);
+    EXPECT_EQ(storage.stats(StorageLocation::GPU).reserved_bytes, 0u);
+    EXPECT_EQ(storage.stats(StorageLocation::CPU).pending_cleanup_bytes, 0u);
+    ASSERT_TRUE(storage.migrate(ids.front(), StorageLocation::GPU).committed);
+    ASSERT_TRUE(storage.migrate(ids.front(), StorageLocation::CPU).committed);
+    EXPECT_EQ(storage.metadata(ids.front()).version, version);
+    auto lease = storage.acquire(ids.front());
+    const auto* data = static_cast<const unsigned char*>(lease.data());
+    EXPECT_TRUE(std::all_of(data, data + lease.size(), [](auto byte) { return byte == 37; }));
+}
+#endif
+
+class ReleaseFailureAllocator final : public infer::DeviceAllocator {
+  public:
+    ReleaseFailureAllocator() : DeviceAllocator(infer::DeviceType::CPU) {}
+    void* allocate(std::size_t bytes, cudaStream_t stream = nullptr) const override {
+        return cpu.allocate(bytes, stream);
+    }
+    void release(void* pointer, cudaStream_t stream = nullptr) const override {
+        if (fail_release.exchange(false)) throw std::runtime_error("CPU release failed");
+        cpu.release(pointer, stream);
+    }
+    mutable std::atomic<bool> fail_release{false};
+    infer::CPUDeviceAllocator cpu;
+};
 
 class OffloadCompletion : public testing::TestWithParam<bool> {};
+
+TEST_P(OffloadCompletion, CommittedBatchCleanupFailureKeepsPlacementAndBudget) {
+    infer::KVOffloadConfig config{4096, 8, 3, "/tmp"};
+    config.overlap_writeback = GetParam();
+    config.promote_hits = 0;
+    config.write_concurrency = 3;
+    config.ssd_verification = infer::SSDVerification::ON_READ;
+    auto allocator = std::make_shared<ReleaseFailureAllocator>();
+    infer::KVOffloadCache cache(config,
+        std::make_unique<infer::CPUStorageBackend>(4096, allocator));
+    std::array<unsigned char, 4096> data{}, output{};
+    data.fill(37);
+    cache.write_many({0, 1, 2}, {data.data(), data.data(), data.data()});
+    allocator->fail_release = true;
+    EXPECT_THROW(cache.write_many({3, 4, 5}, {data.data(), data.data(), data.data()}),
+                 std::runtime_error);
+    // Every accepted migration committed; the failed source release still owns
+    // one CPU slot. A failed batch must apply all placements before unblocking.
+    EXPECT_EQ(cache.stats().demotions, 3u);
+    EXPECT_EQ(cache.stats().cpu_pending_cleanup_bytes, 4096u);
+    EXPECT_EQ(cache.stats().cpu_reserved_bytes, 4096u);
+    EXPECT_EQ(cache.stats().ssd_reserved_bytes, 3u * (4096 + 64));
+    for (auto slot : {0u, 1u, 2u}) {
+        EXPECT_EQ(cache.metadata(slot).location, infer::StorageLocation::SSD);
+        cache.read(slot, output.data());
+        EXPECT_EQ(output, data);
+        EXPECT_TRUE(cache.erase(slot)); // Retries the retained cleanup too.
+    }
+    EXPECT_EQ(cache.stats().cpu_pending_cleanup_bytes, 0u);
+    EXPECT_EQ(cache.stats().cpu_reserved_bytes, 0u);
+    EXPECT_EQ(cache.stats().ssd_reserved_bytes, 0u);
+    cache.write_many({3, 4, 5}, {data.data(), data.data(), data.data()});
+    for (auto slot : {3u, 4u, 5u}) {
+        cache.read(slot, output.data());
+        EXPECT_EQ(output, data);
+    }
+}
 
 TEST_P(OffloadCompletion, FailedDemotionsPreserveSourcesAndAllowRetry) {
     infer::KVOffloadConfig config{4096, 8, 5, "/tmp"};
@@ -210,3 +305,16 @@ extern "C" ssize_t __wrap_pwritev(int fd, const iovec* parts, int count, off_t o
     }
     return __real_pwritev(fd, parts, count, offset);
 }
+
+#if INFER_ENABLE_CUDA
+extern "C" cudaError_t __real_cudaEventSynchronize(cudaEvent_t event);
+extern "C" cudaError_t __real_cudaStreamSynchronize(cudaStream_t stream);
+extern "C" cudaError_t __wrap_cudaEventSynchronize(cudaEvent_t event) {
+    if (fail_copy_wait.exchange(false)) return cudaErrorUnknown;
+    return __real_cudaEventSynchronize(event);
+}
+extern "C" cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t stream) {
+    if (fail_recovery_wait.exchange(false)) return cudaErrorUnknown;
+    return __real_cudaStreamSynchronize(stream);
+}
+#endif

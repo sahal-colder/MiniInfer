@@ -3,12 +3,69 @@
 import argparse
 import hashlib
 import json
+import math
+import os
 from pathlib import Path
+import random
 import struct
-import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
-from benchmark_paged import FIELDS, generate_legacy, layout
+FIELDS = ("dim", "hidden_dim", "layer_num", "head_num", "kv_head_num", "vocab_size", "seq_len")
+
+
+def layout(config):
+    dim, hidden, layers, heads, kv_heads, vocab, context = (config[key] for key in FIELDS)
+    if min(dim, hidden, layers, heads, kv_heads, context) <= 0 or not vocab or dim % heads or heads % kv_heads:
+        raise ValueError("Invalid legacy FP32 model geometry")
+    head_dim = dim // heads
+    if head_dim % 2:
+        raise ValueError("Invalid legacy FP32 model geometry")
+    entries = []
+    cursor = 28
+
+    def add(name, shape):
+        nonlocal cursor
+        size = math.prod(shape) * 4
+        entries.append(dict(name=name, shape=shape, offset=cursor, bytes=size))
+        cursor += size
+
+    add("tok_embeddings.weight", [abs(vocab), dim])
+    for layer in range(layers):
+        add(f"layers.{layer}.attention_norm.weight", [dim])
+    for name, rows in (("wq", dim), ("wk", kv_heads * head_dim), ("wv", kv_heads * head_dim), ("wo", dim)):
+        for layer in range(layers):
+            add(f"layers.{layer}.attention.{name}.weight", [rows, dim])
+    for layer in range(layers):
+        add(f"layers.{layer}.ffn_norm.weight", [dim])
+    for name, shape in (("w1", [hidden, dim]), ("w2", [dim, hidden]), ("w3", [hidden, dim])):
+        for layer in range(layers):
+            add(f"layers.{layer}.feed_forward.{name}.weight", shape)
+    add("norm.weight", [dim])
+    cursor += context * head_dim * 4  # Two legacy RoPE tables, unused by native forward.
+    if vocab < 0:
+        add("output.weight", [abs(vocab), dim])
+    return entries, cursor
+
+
+def generate_legacy(path, config, seed):
+    entries, size = layout(config)
+    rng = random.Random(seed)
+    with path.open("xb") as stream:
+        stream.write(struct.pack("<7i", *(config[key] for key in FIELDS)))
+        for entry in entries:
+            if stream.tell() != entry["offset"]:
+                stream.write(b"\0" * (entry["offset"] - stream.tell()))
+            count = entry["bytes"] // 4
+            norm = "norm" in entry["name"]
+            scale = 0.4 if entry["name"] == "tok_embeddings.weight" else 0.25 / math.sqrt(config["dim"])
+            for start in range(0, count, 65536):
+                amount = min(65536, count - start)
+                values = [1 + rng.uniform(-0.05, 0.05) if norm else rng.uniform(-scale, scale)
+                          for _ in range(amount)]
+                stream.write(struct.pack(f"<{amount}f", *values))
+        if stream.tell() < size:
+            stream.write(b"\0" * (size - stream.tell()))
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def sha256(path):

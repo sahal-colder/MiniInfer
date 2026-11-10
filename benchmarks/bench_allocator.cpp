@@ -17,6 +17,7 @@ struct Sample {
     double microseconds;
 };
 struct Slot { void* pointer = nullptr; std::size_t bytes = 0; };
+struct Counters { std::size_t upstream, reused, central; };
 #if INFER_ENABLE_CUDA
 void cuda_check(cudaError_t error) {
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
@@ -43,9 +44,15 @@ int main(int argc, char** argv) {
         const auto warmup = bench::number(args, "warmup", 1000);
         const auto slots = bench::number(args, "slots", 16);
         const auto seed = bench::number(args, "seed", 42);
+        const auto tls = bench::number(args, "tls", 1);
         if (!threads || !steps || !slots) throw std::invalid_argument("threads/steps/slots must be positive");
+        if (tls > 1) throw std::invalid_argument("--tls must be 0 or 1");
         std::unique_ptr<infer::DeviceAllocator> allocator;
-        if (backend == "cpu-pool") allocator = std::make_unique<infer::CachingCPUDeviceAllocator>();
+        if (backend == "cpu-pool") {
+            infer::CachingCPUAllocatorConfig config;
+            config.enable_thread_cache = tls != 0;
+            allocator = std::make_unique<infer::CachingCPUDeviceAllocator>(config);
+        }
         if (backend == "cpu-raw") allocator = std::make_unique<infer::CPUDeviceAllocator>();
 #if INFER_ENABLE_CUDA
         if (backend == "cuda-raw") allocator = std::make_unique<RawCUDA>();
@@ -112,22 +119,22 @@ int main(int argc, char** argv) {
         }
         while (ready.load() != threads) std::this_thread::yield();
         // Snapshot counter baseline after warmup, while every worker is paused.
-        const auto counters = [&]() -> std::pair<std::size_t, std::size_t> {
+        const auto counters = [&]() -> Counters {
             if (backend == "cpu-pool") {
                 const auto s = static_cast<infer::CachingCPUDeviceAllocator&>(*allocator).stats();
-                return {s.upstream_allocations, s.reuse_count};
+                return {s.upstream_allocations, s.reuse_count, s.central_allocations + s.central_releases};
             }
 #if INFER_ENABLE_CUDA
             if (backend == "pinned-pool") {
                 const auto s = static_cast<infer::CachingPinnedHostAllocator&>(*allocator).stats();
-                return {s.upstream_allocations, s.reuse_count};
+                return {s.upstream_allocations, s.reuse_count, s.central_allocations + s.central_releases};
             }
             if (backend == "cuda-pool") {
                 const auto s = static_cast<infer::CachingCUDADeviceAllocator&>(*allocator).stats();
-                return {s.upstream_allocations, s.reuse_count};
+                return {s.upstream_allocations, s.reuse_count, 0};
             }
 #endif
-            return {0, 0};
+            return {};
         };
         const auto baseline = counters();
         const auto begin = bench::Clock::now();
@@ -166,8 +173,12 @@ int main(int argc, char** argv) {
              << ",\"active_capacity_bytes\":" << (pool ? std::to_string(active) : "null")
              << ",\"reserved_bytes\":" << (pool ? std::to_string(reserved) : "null")
              << ",\"active_requested_bytes\":" << logical
-             << ",\"upstream_allocations\":" << (pool ? std::to_string(final.first - baseline.first) : "null")
-             << ",\"reuse_count\":" << (pool ? std::to_string(final.second - baseline.second) : "null") << "}\n";
+             << ",\"upstream_allocations\":" << (pool ? std::to_string(final.upstream - baseline.upstream) : "null")
+             << ",\"reuse_count\":" << (pool ? std::to_string(final.reused - baseline.reused) : "null")
+             << ",\"cpu_tls\":" << (backend == "cpu-pool" ? std::to_string(tls) : "null")
+             << ",\"central_operations\":"
+             << (backend == "cpu-pool" || backend == "pinned-pool" ?
+                 std::to_string(final.central - baseline.central) : "null") << "}\n";
         if (!out || !meta) throw std::runtime_error("Cannot write allocator results");
         return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

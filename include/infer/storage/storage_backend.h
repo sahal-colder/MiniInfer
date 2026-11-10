@@ -12,6 +12,8 @@
 
 namespace infer {
 
+namespace storage_detail { struct GPUMigrationBatch; }
+
 // 后端分配句柄仅定位某次物理分配。迁移会换句柄，逻辑 BlockId 保持不变。
 using StorageHandle = std::uint64_t;
 enum class HostMemoryKind { PAGEABLE, PINNED };
@@ -158,6 +160,7 @@ class GPUStorageBackend final : public StorageBackend {
     BackendPoolStats pool_stats() const override;
 
   private:
+    friend struct storage_detail::GPUMigrationBatch;
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

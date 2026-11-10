@@ -56,6 +56,17 @@ class AsyncKVPipelineTest : public ::testing::Test {
     }
 };
 
+TEST_F(AsyncKVPipelineTest, FixedSlotsFitWhenCapacityDoesNotDivideAllocatorSlab) {
+    auto large = config;
+    large.max_pages = 128;
+    large.page_bytes = 64 * 1024;
+    large.max_device_bytes = 2 * (8 * 1024 * 1024 + 128 * 1024);
+    AsyncKVPipeline pipeline(large, [](const infer::LayerRead&) {},
+                             [](std::size_t, std::size_t, const std::byte*, const std::byte*) {});
+    EXPECT_LE(pipeline.reserved_device_bytes(), large.max_device_bytes);
+    EXPECT_NE(pipeline.graph_slot(0).pages, pipeline.graph_slot(1).pages);
+}
+
 TEST_F(AsyncKVPipelineTest, AlternatesTwoStableSlotsAndWritesEveryLayerAcrossPages) {
     std::array<std::array<float, page_words * max_pages>, layers> canonical;
     for (std::size_t layer = 0; layer < layers; ++layer)
@@ -152,6 +163,8 @@ TEST_F(AsyncKVPipelineTest, ResidentDownloadAndRetirementPreserveAdmissionBounda
             }
             ++writes;
         });
+    EXPECT_EQ(pipeline.staging_bytes(),
+              layers * max_pages * (config.page_bytes + sizeof(void*)));
     const AsyncKVPipeline::Compute compute =
         [&](std::size_t, AsyncKVPipeline::LayerView view, cudaStream_t stream) {
             infer::check_cuda(cudaMemsetAsync(view.key, 0, config.row_bytes, stream), "clear key");
@@ -165,6 +178,8 @@ TEST_F(AsyncKVPipelineTest, ResidentDownloadAndRetirementPreserveAdmissionBounda
     EXPECT_EQ(writes, layers);
     pipeline.flush_resident();
     EXPECT_EQ(writes, layers);
+    EXPECT_THROW(pipeline.begin_token(0), std::logic_error);
+    EXPECT_THROW(pipeline.begin_token(2), std::logic_error);
 
     void* output = nullptr;
     ASSERT_EQ(cudaMallocHost(&output, config.row_bytes), cudaSuccess);
@@ -172,6 +187,7 @@ TEST_F(AsyncKVPipelineTest, ResidentDownloadAndRetirementPreserveAdmissionBounda
     std::unique_ptr<void, decltype(release)> pinned(output, release);
     pipeline.download(output, pipeline.graph_slot(0).key, config.row_bytes);
     EXPECT_THROW(pipeline.begin_token(1), std::logic_error);
+    EXPECT_THROW(pipeline.flush_resident(), std::logic_error);
     poll_until([&] { return pipeline.poll_download(); });
     EXPECT_TRUE(pipeline.poll_download());
     pipeline.begin_retire();

@@ -58,7 +58,7 @@ TEST_F(CUDAGraphModelTest, MatchesEagerAcrossPagesTokensResetAndPrefixReuse) {
     settings.enable_cuda_graph = true;
     mini_infer::LlamaModel graph((directory / "model.bin").string(), allocator, settings);
     const auto initial = graph.cuda_graph_stats();
-    EXPECT_EQ(initial.graphs, 2u * config.layer_num);
+    EXPECT_EQ(initial.graphs, config.layer_num);
     EXPECT_GT(initial.workspace_bytes, 0u);
     const std::vector<int32_t> prompt{2, 4, 0, 8, 10, 12, 6, 9, 1};
     float max_error = 0;
@@ -120,7 +120,7 @@ TEST_F(CUDAGraphModelTest, ReportsPairedEndToEndDecodeTPOT) {
     std::sort(graph_us.begin(), graph_us.end());
     std::cout << "[CUDA Graph TPOT median, 5 pairs, 24 tokens/pair, includes KV I/O and logits D2H] eager_us="
               << eager_us[2] << " graph_us=" << graph_us[2] << " speedup=" << eager_us[2] / graph_us[2] << '\n';
-    EXPECT_EQ(graph.cuda_graph_stats().graphs, 2u * config.layer_num);
+    EXPECT_EQ(graph.cuda_graph_stats().graphs, config.layer_num);
     EXPECT_GT(graph.cuda_graph_stats().replays, 0u);
 }
 

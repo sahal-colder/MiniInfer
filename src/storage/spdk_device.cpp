@@ -443,6 +443,12 @@ class SpdkDevice final : public SSDDevice, public std::enable_shared_from_this<S
             if (self.config_.offset_bytes > capacity ||
                 self.config_.capacity_bytes > capacity - self.config_.offset_bytes)
                 throw std::invalid_argument("SPDK region exceeds bdev capacity");
+            spdk_bdev_opts bdev_options{};
+            spdk_bdev_get_opts(&bdev_options, sizeof(bdev_options));
+            // SPDK wakes io_wait callbacks from its per-thread free-I/O cache.
+            // A zero cache accepts waiters but cannot wake them after ENOMEM.
+            if (!bdev_options.bdev_io_cache_size)
+                throw std::invalid_argument("SPDK I/O wait requires nonzero bdev_io_cache_size");
             self.channel_ = spdk_bdev_get_io_channel(self.desc_);
             if (!self.channel_)
                 throw std::runtime_error("SPDK I/O channel allocation failed");

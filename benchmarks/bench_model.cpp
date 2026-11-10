@@ -126,6 +126,8 @@ int main(int argc, char** argv) {
                 << ",\"gpu_limit_bytes\":" << after.gpu_limit_bytes
                 << ",\"host_limit_bytes\":" << after.host_limit_bytes
                 << ",\"graph_replays\":" << graph_after.replays - graph_before.replays
+                << ",\"graphs\":" << graph_after.graphs
+                << ",\"graph_workspace_bytes\":" << graph_after.workspace_bytes
                 << ",\"ballast_bytes\":" << ballast_bytes << ",\"tokens\":[";
             for (std::size_t i = 0; i < tokens.size(); ++i) { if (i) out << ','; out << tokens[i]; }
             out << "],\"decode_samples_ms\":[";

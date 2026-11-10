@@ -23,7 +23,7 @@ std::size_t transfer_bytes(const FileIORequest& r) {
         throw std::invalid_argument("FileIO prefix size overflow");
     return r.prefix_bytes + r.bytes;
 }
-int vectors(const FileIORequest& r, std::size_t done, iovec* out) {
+int write_vectors(const FileIORequest& r, std::size_t done, iovec* out) {
     int count = 0;
     if (done < r.prefix_bytes) {
         out[count++] = {const_cast<char*>(static_cast<const char*>(r.prefix)) + done,
@@ -34,6 +34,12 @@ int vectors(const FileIORequest& r, std::size_t done, iovec* out) {
     }
     if (done < r.bytes)
         out[count++] = {static_cast<char*>(r.data) + done, r.bytes - done};
+    // Both backends cap the combined prefix/payload at the scalar syscall limit.
+    std::size_t left = INT_MAX;
+    for (int i = 0; i < count; ++i) {
+        out[i].iov_len = std::min(out[i].iov_len, left);
+        left -= out[i].iov_len;
+    }
     return count;
 }
 void validate(const std::vector<FileIORequest>& requests, bool write) {
@@ -113,13 +119,7 @@ void posix_io(int fd, const std::vector<FileIORequest>& requests, bool write) {
             ssize_t n;
             if (write && r.prefix_bytes) {
                 iovec parts[2];
-                const auto count = vectors(r, done, parts);
-                // Limit each syscall as for the scalar path, including large payloads.
-                std::size_t left = INT_MAX;
-                for (int i = 0; i < count; ++i) {
-                    parts[i].iov_len = std::min(parts[i].iov_len, left);
-                    left -= parts[i].iov_len;
-                }
+                const auto count = write_vectors(r, done, parts);
                 n = ::pwritev(fd, parts, count, r.offset + done);
             } else {
                 auto* address = static_cast<char*>(r.data) + done;
@@ -239,12 +239,7 @@ struct FileIO::Impl {
                     const auto count =
                         unsigned(std::min(transfer_bytes(r) - done[i], std::size_t(INT_MAX)));
                     if (write && r.prefix_bytes) {
-                        const auto n = vectors(r, done[i], parts[i].data());
-                        std::size_t left = INT_MAX;
-                        for (int j = 0; j < n; ++j) {
-                            parts[i][j].iov_len = std::min(parts[i][j].iov_len, left);
-                            left -= parts[i][j].iov_len;
-                        }
+                        const auto n = write_vectors(r, done[i], parts[i].data());
                         io_uring_prep_writev(sqe, fixed ? 0 : fd, parts[i].data(), n,
                                              r.offset + done[i]);
                     } else {

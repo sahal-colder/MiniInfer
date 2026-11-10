@@ -166,8 +166,24 @@ class MiniInferTieredConnector(MiniInferConnector):
         groups = kv_cache_config.kv_cache_groups
         if len(groups) != 1 or not isinstance(groups[0].kv_cache_spec, FullAttentionSpec):
             raise ValueError("Tiered admission supports one FullAttention KV group")
+
+        cpu_bytes = self._configure_cache_budget(kv_cache_config, extra)
+        super().__init__(vllm_config, role, kv_cache_config)
+        self.admission = None
+        self.cost_model = None
+        self.prompt_policy = None
+        self._restore_decisions = {}
+        self._configure_scheduler(vllm_config, kv_cache_config, extra)
+        if self.worker_handler is not None and not self.pinned_resident:
+            self.worker_handler._miniinfer_cpu_bytes = cpu_bytes
+            self.worker_handler._init_disk_mode = types.MethodType(
+                _init_tiered_mode, self.worker_handler
+            )
+
+    def _configure_cache_budget(self, kv_cache_config, extra):
+        payload = None
         if "miniinfer_ssd_bytes" in extra:
-            payload = sum(t.size for t in kv_cache_config.kv_cache_tensors) // kv_cache_config.num_blocks
+            payload = _block_payload_bytes(kv_cache_config)
             capacity = ssd_payload_capacity(
                 extra["miniinfer_ssd_bytes"], payload,
                 os.environ.get("MINIINFER_COMPACT_SLOTS", "0") == "1",
@@ -184,32 +200,31 @@ class MiniInferTieredConnector(MiniInferConnector):
             raise ValueError("Pinned resident mode requires capacity admission")
         if self.pinned_resident and extra.get("kv_offload_backend", "cpu") != "cpu":
             raise ValueError("Pinned resident mode requires the native CPU DMA backend")
-        if "miniinfer_host_total_bytes" in extra:
-            total = extra["miniinfer_host_total_bytes"]
-            if type(total) is not int or total <= 0:
-                raise ValueError("Total host budget must be a positive integer")
-            payload = (
-                sum(t.size for t in kv_cache_config.kv_cache_tensors) // kv_cache_config.num_blocks
-            )
-            cpu_bytes = (
-                total
-                if self.pinned_resident
-                else host_cache_budget(
-                    total,
+        total_host_bytes = extra.get("miniinfer_host_total_bytes", 0)
+        if "miniinfer_host_total_bytes" in extra and (
+            type(total_host_bytes) is not int or total_host_bytes <= 0
+        ):
+            raise ValueError("Total host budget must be a positive integer")
+        if not total_host_bytes and not self.cpu_resident:
+            return cpu_bytes
+        if payload is None:
+            payload = _block_payload_bytes(kv_cache_config)
+        if total_host_bytes:
+            cpu_bytes = total_host_bytes
+            if not self.pinned_resident:
+                spdk_bdev = os.environ.get("MINIINFER_SPDK_BDEV")
+                cpu_bytes = host_cache_budget(
+                    total_host_bytes,
                     payload,
                     extra.get("disk_buffer_slots", 2),
                     extra.get("miniinfer_pooled_staging", False),
                     os.environ.get("MINIINFER_COMPACT_SLOTS", "0") == "1",
                     (int(os.environ.get("MINIINFER_SPDK_MEM_MIB", "256")) << 20)
-                    if os.environ.get("MINIINFER_SPDK_BDEV")
+                    if spdk_bdev
                     else 0,
-                    staging_in_device=bool(os.environ.get("MINIINFER_SPDK_BDEV")),
+                    staging_in_device=bool(spdk_bdev),
                 )
-            )
         if self.cpu_resident:
-            payload = (
-                sum(t.size for t in kv_cache_config.kv_cache_tensors) // kv_cache_config.num_blocks
-            )
             # arena 内按 payload 紧排；整块采用现有 CPU/Pinned 池的四分之一档位。
             slot = (
                 payload
@@ -223,53 +238,40 @@ class MiniInferTieredConnector(MiniInferConnector):
             # 外部逻辑槽与物理 CPU 容量匹配，替换时复用原 CPU 槽，不制造无价值 SSD 写回。
             extra["disk_capacity_bytes"] = slots * payload
             extra["cpu_bytes_to_use"] = slots * payload
-        super().__init__(vllm_config, role, kv_cache_config)
-        self.admission = None
-        self.cost_model = None
-        self.prompt_policy = None
-        self._restore_decisions = {}
-        if self.scheduler_manager is not None:
-            if self.cpu_resident:
-                manager = self.scheduler_manager
-                capacity = (
-                    (manager.num_cpu_blocks - 1) * manager.block_size // manager.hash_block_size
-                )
-                self.admission = CapacityAdmission(
-                    capacity,
-                    extra.get("miniinfer_min_reuse", 2),
-                    extra.get("miniinfer_history_capacity", 16384),
-                )
-            else:
-                self.admission = FrequencyAdmission(
-                    extra.get("miniinfer_min_reuse", 2),
-                    extra.get("miniinfer_history_capacity", 16384),
-                )
-                self.admission.prompt_only = bool(extra.get("miniinfer_prompt_only", False))
-            if extra.get("miniinfer_cost_profile") is not None:
-                self.cost_model = CacheCostModel(
-                    extra["miniinfer_cost_profile"], extra.get("miniinfer_cost_identity")
-                )
-                self.admission.cost_model = self.cost_model
-                self.admission.tokens_per_block = self.scheduler_manager.hash_block_size
-            install_admission(self.scheduler_manager, self.admission)
-            if (
-                extra.get("miniinfer_prompt_offload", True)
-                and not self.cpu_resident
-                and not self.admission.prompt_only
-            ):
-                self.prompt_policy = PromptOffloadPolicy(
-                    self.scheduler_manager,
-                    vllm_config.scheduler_config.max_num_batched_tokens,
-                    max(1024, 4 * kv_cache_config.num_blocks),
-                )
-                self.prompt_policy.install()
-                PROMPT_POLICIES.append(self.prompt_policy)
-            POLICIES.append(self.admission)
-        if self.worker_handler is not None and not self.pinned_resident:
-            self.worker_handler._miniinfer_cpu_bytes = cpu_bytes
-            self.worker_handler._init_disk_mode = types.MethodType(
-                _init_tiered_mode, self.worker_handler
+        return cpu_bytes
+
+    def _configure_scheduler(self, vllm_config, kv_cache_config, extra):
+        manager = self.scheduler_manager
+        if manager is None:
+            return
+        min_reuse = extra.get("miniinfer_min_reuse", 2)
+        history_capacity = extra.get("miniinfer_history_capacity", 16384)
+        if self.cpu_resident:
+            capacity = (manager.num_cpu_blocks - 1) * manager.block_size // manager.hash_block_size
+            self.admission = CapacityAdmission(capacity, min_reuse, history_capacity)
+        else:
+            self.admission = FrequencyAdmission(min_reuse, history_capacity)
+            self.admission.prompt_only = bool(extra.get("miniinfer_prompt_only", False))
+        if extra.get("miniinfer_cost_profile") is not None:
+            self.cost_model = CacheCostModel(
+                extra["miniinfer_cost_profile"], extra.get("miniinfer_cost_identity")
             )
+            self.admission.cost_model = self.cost_model
+            self.admission.tokens_per_block = manager.hash_block_size
+        install_admission(manager, self.admission)
+        if (
+            extra.get("miniinfer_prompt_offload", True)
+            and not self.cpu_resident
+            and not self.admission.prompt_only
+        ):
+            self.prompt_policy = PromptOffloadPolicy(
+                manager,
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                max(1024, 4 * kv_cache_config.num_blocks),
+            )
+            self.prompt_policy.install()
+            PROMPT_POLICIES.append(self.prompt_policy)
+        POLICIES.append(self.admission)
 
     def get_num_new_matched_tokens(self, request, num_computed_tokens):
         hit, asynchronous = super().get_num_new_matched_tokens(request, num_computed_tokens)
@@ -332,6 +334,10 @@ class MiniInferTieredConnector(MiniInferConnector):
             if self.prompt_policy is not None:
                 self.prompt_policy.reset()
         return result
+
+
+def _block_payload_bytes(kv_cache_config):
+    return sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors) // kv_cache_config.num_blocks
 
 
 def _init_tiered_mode(worker, caches, bytes_per_block, device):

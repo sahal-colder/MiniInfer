@@ -258,12 +258,82 @@ MigrationResult execute_transfer(StorageState& state, LogicalBlockRecord& record
     return finish_transfer(state, record, error, quarantined);
 }
 
-std::size_t execute_chunk_batch(StorageState& state, const std::vector<LogicalBlockRecord*>& records,
+#if INFER_ENABLE_CUDA
+static std::size_t execute_pinned_batch(StorageState& state,
+                                        const std::vector<LogicalBlockRecord*>& records,
+                                        std::vector<MigrationResult>& results, std::size_t first) {
+    auto* head = records[first];
+    auto* gpu = dynamic_cast<GPUStorageBackend*>(head->transfer->gpu);
+    if (!gpu) return first;
+    const auto source = head->meta.location;
+    const bool to_gpu = source == StorageLocation::CPU;
+    auto* cpu = dynamic_cast<CPUStorageBackend*>(
+        to_gpu ? head->backend : head->transfer->auxiliary.backend);
+    if (!cpu) return first;
+    auto end = first + 1;
+    for (; end < records.size(); ++end) {
+        const auto* record = records[end];
+        if (!record || !record->transfer->direct_host || record->transfer->gpu != gpu ||
+            record->meta.location != source ||
+            (to_gpu ? record->backend : record->transfer->auxiliary.backend) != cpu)
+            break;
+    }
+    if (end - first < 2) return first;
+
+    std::array<GPUMigrationBatch::Copy, 64> copies;
+    try {
+        for (auto i = first; i < end; ++i) {
+            auto& record = *records[i];
+            auto& target = record.transfer->auxiliary;
+            if (!target.handle)
+                target.handle = target.backend->reserve(record.meta.size);
+            record.backend->validate(record.allocation, record.meta);
+            const auto src = checked_memory_view(*record.backend, record.allocation, source,
+                                                 record.meta.size);
+            const auto dst = checked_memory_view(*target.backend, target.handle,
+                                                 target.backend->location(), record.meta.size);
+            copies[i - first] = {to_gpu ? dst.data : src.data, to_gpu ? src.data : dst.data,
+                                 record.meta.size};
+        }
+    } catch (...) {
+        // Individual execution preserves per-block results if a destination cannot be prepared.
+        return first;
+    }
+
+    std::size_t submitted = 0;
+    bool completion_unknown = false;
+    std::exception_ptr error;
+    try {
+        error = GPUMigrationBatch::copy(*gpu, copies.data(), end - first, to_gpu, submitted,
+                                       completion_unknown);
+    } catch (...) {
+        if (!completion_unknown) return first;
+        error = std::current_exception();
+    }
+    // An unsuccessful submission can still leave work queued. Its buffers are
+    // owned by the transaction until the event or the recovery wait confirms completion.
+    const auto processed = submitted + (error && submitted < end - first ? 1 : 0);
+    for (std::size_t i = 0; i < processed; ++i) {
+        auto& record = *records[first + i];
+        record.transfer->completion_unknown = completion_unknown;
+        results[first + i] = finish_transfer(state, record,
+                                            completion_unknown || i == submitted ? error : nullptr,
+                                            nullptr);
+    }
+    return first + processed;
+}
+#endif
+
+std::size_t execute_batch_group(StorageState& state, const std::vector<LogicalBlockRecord*>& records,
                                 std::vector<MigrationResult>& results, std::size_t first,
                                 bool& quarantined) {
     auto* head = records[first];
     if (!head || head->transfer->reuse_ssd_copy)
         return first;
+#if INFER_ENABLE_CUDA
+    if (head->transfer->direct_host)
+        return execute_pinned_batch(state, records, results, first);
+#endif
     const auto source = head->meta.location;
     const auto target = head->transfer->auxiliary.backend->location();
     const bool write = target == StorageLocation::SSD;
