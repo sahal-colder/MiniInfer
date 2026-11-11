@@ -39,6 +39,25 @@ std::unique_ptr<StorageBackend> cpu_from_allocator(std::shared_ptr<DeviceAllocat
         throw std::invalid_argument("Storage requires a non-null CPU allocator");
     return std::make_unique<CPUStorageBackend>(StorageConfig{}.block_bytes, std::move(allocator));
 }
+
+std::unique_ptr<StorageBackend> default_ssd_backend(const StorageConfig& config) {
+    const auto bytes = config.budget.ssd_bytes;
+    if (config.ssd_direct) {
+        if (!config.ssd_spdk.bdev_name.empty())
+            throw std::invalid_argument("Choose direct-file or SPDK, not both");
+        auto device = io::open_direct_file_device(
+            config.ssd_directory, bytes / io_alignment * io_alignment, config.ssd_io.queue_depth);
+        return std::make_unique<SSDStorageBackend>(config.block_bytes, bytes, std::move(device),
+                                                   config.ssd_verification);
+    }
+    if (!config.ssd_spdk.bdev_name.empty()) {
+        return std::make_unique<SSDStorageBackend>(
+            config.block_bytes, bytes, open_spdk_device(config.ssd_spdk), config.ssd_verification);
+    }
+    return std::make_unique<SSDStorageBackend>(config.block_bytes, bytes, config.ssd_directory,
+                                               config.ssd_io, config.ssd_verification);
+}
+
 void validate_backend(const StorageBackend* backend, StorageLocation location,
                       std::size_t slot_bytes) {
     const auto charged = location == StorageLocation::SSD
@@ -168,23 +187,7 @@ TieredStorage::TieredStorage(StorageConfig config, std::unique_ptr<StorageBacken
     if (config.budget.ssd_bytes) {
         if (config.budget.ssd_bytes < SSDStorageBackend::allocation_size(config.block_bytes))
             throw std::invalid_argument("SSD budget omits record header");
-        if (!ssd) {
-            if (config.ssd_direct && !config.ssd_spdk.bdev_name.empty())
-                throw std::invalid_argument("Choose direct-file or SPDK, not both");
-            if (config.ssd_direct)
-                ssd = std::make_unique<SSDStorageBackend>(config.block_bytes, config.budget.ssd_bytes,
-                    io::open_direct_file_device(config.ssd_directory,
-                        config.budget.ssd_bytes / io_alignment * io_alignment, config.ssd_io.queue_depth),
-                    config.ssd_verification);
-            else if (config.ssd_spdk.bdev_name.empty())
-                ssd = std::make_unique<SSDStorageBackend>(
-                    config.block_bytes, config.budget.ssd_bytes, config.ssd_directory,
-                    config.ssd_io, config.ssd_verification);
-            else
-                ssd = std::make_unique<SSDStorageBackend>(
-                    config.block_bytes, config.budget.ssd_bytes, open_spdk_device(config.ssd_spdk),
-                    config.ssd_verification);
-        }
+        if (!ssd) ssd = default_ssd_backend(config);
         if (ssd->allocation_bytes() > config.budget.ssd_bytes)
             throw std::invalid_argument("SSD budget omits device alignment");
     }

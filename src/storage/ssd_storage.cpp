@@ -1,7 +1,7 @@
-#include "crc32c/crc32c.h"
 #include "infer/cpu/cpu_memory_pool.h"
 #include "infer/storage/storage_backend.h"
 #include "slot_table.h"
+#include "ssd_record.h"
 
 #include <algorithm>
 #include <array>
@@ -26,6 +26,13 @@
 #include <vector>
 
 namespace infer {
+using storage_detail::combine_crc;
+using storage_detail::encode_ssd_header;
+using storage_detail::extend_crc;
+using storage_detail::SSDRecordHeader;
+using storage_detail::validate_ssd_header;
+using storage_detail::validate_ssd_payload_crc;
+
 namespace {
 struct IOTimer {
     std::atomic<std::uint64_t>& total;
@@ -41,73 +48,10 @@ struct IOTimer {
 // otherwise send several concurrent workers to the same ring mutex.
 std::size_t request_lane(bool write) {
     static std::atomic<std::size_t> next[2]{};
-    thread_local std::size_t lanes[2]={SIZE_MAX,SIZE_MAX};
-    if(lanes[write]==SIZE_MAX) lanes[write]=next[write].fetch_add(1,std::memory_order_relaxed)%4;
+    thread_local std::size_t lanes[2] = {SIZE_MAX, SIZE_MAX};
+    if (lanes[write] == SIZE_MAX)
+        lanes[write] = next[write].fetch_add(1, std::memory_order_relaxed) % 4;
     return lanes[write];
-}
-using Header = std::array<unsigned char, SSDStorageBackend::record_header_bytes>;
-constexpr unsigned char magic[8] = {'M', 'I', 'N', 'I', 'K', 'V', '0', '4'};
-// Google CRC32C 按运行时 CPU 能力选择实现；其接口使用最终取反后的 CRC，
-// 这里转换为原有的增量状态，保持文件格式和分段写入结果完全一致。
-std::uint32_t extend_crc(std::uint32_t crc, const void* data, std::size_t bytes) {
-    return ~::crc32c::Extend(~crc, static_cast<const std::uint8_t*>(data), bytes);
-}
-using CRCMatrix = std::array<std::uint32_t, 32>;
-std::uint32_t apply_crc(const CRCMatrix& matrix, std::uint32_t value) {
-    std::uint32_t result = 0;
-    for (std::size_t bit = 0; value; ++bit, value >>= 1)
-        if (value & 1)
-            result ^= matrix[bit];
-    return result;
-}
-std::uint32_t combine_crc(std::uint32_t first, std::uint32_t second, std::size_t bytes) {
-    // Powers of the Castagnoli zero-byte operator combine finalized CRCs
-    // without rereading the independently checked payload ranges.
-    static const auto powers = [] {
-        std::array<CRCMatrix, sizeof(std::size_t) * CHAR_BIT> result{};
-        CRCMatrix matrix{};
-        matrix[0] = 0x82f63b78u;
-        for (std::size_t i = 1; i < matrix.size(); ++i)
-            matrix[i] = std::uint32_t(1) << (i - 1);
-        for (std::size_t bit = 0; bit < result.size() + 3; ++bit) {
-            if (bit >= 3)
-                result[bit - 3] = matrix;
-            CRCMatrix square{};
-            for (std::size_t i = 0; i < matrix.size(); ++i)
-                square[i] = apply_crc(matrix, matrix[i]);
-            matrix = square;
-        }
-        return result;
-    }();
-    for (std::size_t bit = 0; bytes; ++bit, bytes >>= 1)
-        if (bytes & 1)
-            first = apply_crc(powers[bit], first);
-    return first ^ second;
-}
-void put(Header& header, std::size_t offset, std::uint64_t value, std::size_t bytes) {
-    for (std::size_t i = 0; i < bytes; ++i)
-        header[offset + i] = static_cast<unsigned char>(value >> (8 * i));
-}
-std::uint64_t get(const Header& header, std::size_t offset, std::size_t bytes) {
-    std::uint64_t result = 0;
-    for (std::size_t i = 0; i < bytes; ++i)
-        result |= std::uint64_t(header[offset + i]) << (8 * i);
-    return result;
-}
-Header record_header(const BlockMeta& meta, std::size_t capacity, std::uint32_t crc,
-                     std::size_t payload_offset, bool verify) {
-    Header header{};
-    std::memcpy(header.data(), magic, 8);
-    put(header, 8, payload_offset == SSDStorageBackend::record_header_bytes ? 1 : 2, 4);
-    put(header, 12, SSDStorageBackend::record_header_bytes, 4);
-    put(header, 16, meta.id, 8);
-    put(header, 24, meta.version, 8);
-    put(header, 32, meta.size, 8);
-    put(header, 40, capacity, 8);
-    put(header, 48, crc, 4);
-    put(header, 56, payload_offset == SSDStorageBackend::record_header_bytes ? 0 : payload_offset, 8);
-    if (verify) put(header, 52, storage_detail::crc32c(header.data(), header.size()), 4);
-    return header;
 }
 [[noreturn]] void io_error(const char* operation) {
     throw std::system_error(errno, std::generic_category(), operation);
@@ -224,10 +168,6 @@ class BatchIO {
     bool stopped_ = false;
 };
 } // namespace
-std::uint32_t storage_detail::crc32c(const void* data, std::size_t bytes) {
-    return ~extend_crc(~0u, data, bytes);
-}
-
 struct SSDStorageBackend::Impl {
     struct Allocation {
         mutable std::mutex mutex;
@@ -320,7 +260,7 @@ struct SSDStorageBackend::Impl {
         } else
             write_all(file_at(offset), host, bytes, file_offset(offset));
     }
-    void write_header(const Header& header, off_t offset) {
+    void write_header(const SSDRecordHeader& header, off_t offset) {
         if (metadata_padding.empty()) {
             write_range(header.data(), header.size(), offset);
             return;
@@ -470,13 +410,10 @@ struct SSDStorageBackend::Impl {
         }
         return ~crc;
     }
-    static void check_crc(std::uint32_t crc, const Header& header) {
-        if (crc != get(header, 48, 4))
-            throw std::system_error(EBADMSG, std::generic_category(), "SSD payload CRC32C mismatch");
-    }
-    void check_payload(const StorageRead& request, const Header& header) const {
+    void check_payload(const StorageRead& request, const SSDRecordHeader& header) const {
         if (verification != SSDVerification::NONE)
-            check_crc(storage_detail::crc32c(request.host, request.expected.size), header);
+            validate_ssd_payload_crc(storage_detail::crc32c(request.host, request.expected.size),
+                                     header);
     }
     // 在同一遍读取中计算 CRC 并提取请求区间，避免先校验后另读引入内容差异。
     std::uint32_t payload_crc(const Allocation& allocation, std::size_t size, void* host = nullptr,
@@ -503,27 +440,14 @@ struct SSDStorageBackend::Impl {
         return ~crc;
     }
     void check_header(const Allocation& allocation, const BlockMeta& expected,
-                      Header header) const {
-        if (!expected.id || !expected.version || !expected.size || expected.size > payload)
-            throw std::system_error(EBADMSG, std::generic_category(), "Invalid SSD record metadata");
-        const auto header_crc = get(header, 52, 4);
-        put(header, 52, 0, 4);
-        if (std::memcmp(header.data(), magic, 8) ||
-            get(header, 8, 4) != (payload_offset == record_header_bytes ? 1 : 2) ||
-            get(header, 12, 4) != record_header_bytes || get(header, 16, 8) != expected.id ||
-            get(header, 24, 8) != expected.version || get(header, 32, 8) != expected.size ||
-            get(header, 40, 8) != payload ||
-            get(header, 56, 8) != (payload_offset == record_header_bytes ? 0 : payload_offset) ||
-            get(header, 48, 4) != std::uint32_t(~allocation.crc) ||
-            (verification != SSDVerification::NONE &&
-             header_crc != storage_detail::crc32c(header.data(), header.size()))) {
-            throw std::system_error(EBADMSG, std::generic_category(), "SSD record header/identity mismatch");
-        }
+                      const SSDRecordHeader& header) const {
+        validate_ssd_header(header, expected, payload, ~allocation.crc, payload_offset,
+                            verification != SSDVerification::NONE);
     }
     void checked_read(const Allocation& allocation, const BlockMeta& expected, void* host = nullptr,
                       std::size_t begin = 0, std::size_t bytes = 0,
                       FileIO* lane = nullptr) const {
-        Header header{};
+        SSDRecordHeader header{};
         read_range(header.data(), header.size(), offset(allocation), lane);
         check_header(allocation, expected, header);
         if (verification == SSDVerification::NONE) {
@@ -533,7 +457,8 @@ struct SSDStorageBackend::Impl {
             }
             return;
         }
-        check_crc(payload_crc(allocation, expected.size, host, begin, bytes, lane), header);
+        validate_ssd_payload_crc(payload_crc(allocation, expected.size, host, begin, bytes, lane),
+                                 header);
     }
     void parallel_read(const Allocation& allocation, const BlockMeta& expected, void* host) {
         if (verification == SSDVerification::NONE) {
@@ -542,7 +467,7 @@ struct SSDStorageBackend::Impl {
         }
         if (expected.size > UINTPTR_MAX - reinterpret_cast<std::uintptr_t>(host))
             throw std::invalid_argument("Invalid SSD read destination");
-        Header header{};
+        SSDRecordHeader header{};
         read_range(header.data(), header.size(), offset(allocation));
         check_header(allocation, expected, header);
         prepare_parallel(false);
@@ -561,7 +486,7 @@ struct SSDStorageBackend::Impl {
         auto crc = crcs[0];
         for (std::size_t i = 1; i < crcs.size(); ++i)
             crc = combine_crc(crc, crcs[i], sizes[i]);
-        check_crc(crc, header);
+        validate_ssd_payload_crc(crc, header);
     }
 };
 
@@ -746,7 +671,9 @@ void SSDStorageBackend::publish(StorageHandle handle, const BlockMeta& meta) {
         throw std::invalid_argument("SSD publication requires complete content and identity");
     }
     allocation.sealed = false;
-    const auto header = record_header(meta, impl_->payload, ~allocation.crc, impl_->payload_offset, impl_->verification != SSDVerification::NONE);
+    const auto header =
+        encode_ssd_header(meta, impl_->payload, ~allocation.crc, impl_->payload_offset,
+                          impl_->verification != SSDVerification::NONE);
     impl_->write_header(header, impl_->offset(allocation));
     // READ_BACK verifies publication; ON_READ defers CRC until consumption.
     if (impl_->verification == SSDVerification::READ_BACK)
@@ -767,88 +694,93 @@ void SSDStorageBackend::write_published_many(const std::vector<StorageWrite>& re
     IOTimer timer{impl_->write_ns};
     std::vector<std::shared_ptr<Impl::Allocation>> allocations(requests.size());
     std::vector<std::unique_lock<std::mutex>> locks;
-    std::vector<Header> headers(requests.size());
+    std::vector<SSDRecordHeader> headers(requests.size());
     const auto order = impl_->lock_batch(requests, allocations, locks);
     for (auto i : order) {
-        const auto& r = requests[i];
-        storage_detail::validate_io(impl_->payload, 0, r.host, r.meta.size);
-        if (!r.meta.id || !r.meta.version || !r.meta.size)
+        const auto& request = requests[i];
+        storage_detail::validate_io(impl_->payload, 0, request.host, request.meta.size);
+        if (!request.meta.id || !request.meta.version || !request.meta.size)
             throw std::invalid_argument("SSD publication requires complete content and identity");
     }
     // Validate every request before changing old records; locks outlive all shards.
-    for (auto& a : allocations) {
-        a->sealed = false;
-        a->written = 0;
+    for (auto& allocation : allocations) {
+        allocation->sealed = false;
+        allocation->written = 0;
     }
-    const auto shard = [&](std::size_t first, std::size_t end, FileIO* io, std::size_t lane) {
+    const bool verify_crc = impl_->verification != SSDVerification::NONE;
+    const auto write_shard = [&](std::size_t first, std::size_t end, FileIO* io,
+                                 std::size_t file_shard) {
         std::vector<FileIORequest> ranges;
         ranges.reserve((impl_->metadata_padding.empty() ? 1 : 2) * (end - first));
         std::vector<std::size_t> selected;
         for (auto i = first; i < end; ++i) {
-            if (impl_->file_count > 1 && allocations[i]->slot % impl_->file_count != lane)
+            auto& allocation = *allocations[i];
+            if (impl_->file_count > 1 && allocation.slot % impl_->file_count != file_shard)
                 continue;
             selected.push_back(i);
-            const auto& r = requests[i];
-            const auto offset = impl_->file_offset(impl_->offset(*allocations[i]));
+            const auto& request = requests[i];
+            const auto offset = impl_->file_offset(impl_->offset(allocation));
+            const auto bytes = request.meta.size;
             // Keep CRC and the following page-cache copy within the private
             // cache. The final header is published only after every payload piece.
             constexpr std::size_t window_bytes = 1024 * 1024;
-            if (impl_->verification != SSDVerification::NONE && !impl_->device && r.meta.size > window_bytes) {
+            if (verify_crc && !impl_->device && bytes > window_bytes) {
                 std::uint32_t crc = ~0u;
-                for (std::size_t done = 0; done < r.meta.size;) {
-                    const auto n = std::min(window_bytes, r.meta.size - done);
-                    const auto* source = static_cast<const unsigned char*>(r.host) + done;
+                for (std::size_t done = 0; done < bytes;) {
+                    const auto n = std::min(window_bytes, bytes - done);
+                    const auto* source = static_cast<const unsigned char*>(request.host) + done;
                     crc = extend_crc(crc, source, n);
                     impl_->source_crc_bytes.fetch_add(n, std::memory_order_relaxed);
-                    io->write_many(impl_->files[lane % impl_->file_count],
+                    io->write_many(impl_->files[file_shard % impl_->file_count],
                                    {{const_cast<unsigned char*>(source), n,
                                      offset + impl_->payload_offset + done}});
                     done += n;
                 }
-                allocations[i]->crc = crc;
-                headers[i] = record_header(r.meta, impl_->payload, ~crc, impl_->payload_offset, impl_->verification != SSDVerification::NONE);
+                allocation.crc = crc;
+                headers[i] = encode_ssd_header(request.meta, impl_->payload, ~crc,
+                                               impl_->payload_offset, verify_crc);
                 ranges.push_back({headers[i].data(), headers[i].size(), offset});
                 continue;
             }
-            const auto crc = impl_->verification == SSDVerification::NONE
-                ? 0 : storage_detail::crc32c(r.host, r.meta.size);
-            if (impl_->verification != SSDVerification::NONE)
-                impl_->source_crc_bytes.fetch_add(r.meta.size, std::memory_order_relaxed);
-            allocations[i]->crc = ~crc;
-            headers[i] = record_header(r.meta, impl_->payload, crc, impl_->payload_offset, impl_->verification != SSDVerification::NONE);
+            const auto crc = verify_crc ? storage_detail::crc32c(request.host, bytes) : 0;
+            if (verify_crc) impl_->source_crc_bytes.fetch_add(bytes, std::memory_order_relaxed);
+            allocation.crc = ~crc;
+            headers[i] = encode_ssd_header(request.meta, impl_->payload, crc, impl_->payload_offset,
+                                           verify_crc);
             if (!impl_->metadata_padding.empty()) {
                 ranges.push_back({impl_->metadata_padding.data(), impl_->metadata_padding.size(),
                                   offset, headers[i].data(), headers[i].size()});
-                ranges.push_back({const_cast<void*>(r.host), r.meta.size,
-                                  offset + impl_->payload_offset});
+                ranges.push_back(
+                    {const_cast<void*>(request.host), bytes, offset + impl_->payload_offset});
                 continue;
             }
-            ranges.push_back({const_cast<void*>(r.host), r.meta.size,
-                              offset, headers[i].data(),
+            ranges.push_back({const_cast<void*>(request.host), bytes, offset, headers[i].data(),
                               headers[i].size()});
         }
         // Small records use one writev/SQE; large payloads precede their final header.
         if (impl_->device)
             impl_->device_batch(true, ranges, selected);
         else
-            io->write_many(impl_->files[lane % impl_->file_count], ranges);
+            io->write_many(impl_->files[file_shard % impl_->file_count], ranges);
         for (auto i : selected) {
-            auto& a = *allocations[i];
-            const auto& r = requests[i];
-            a.written = r.meta.size;
-            impl_->written_bytes.fetch_add(r.meta.size, std::memory_order_relaxed);
+            auto& allocation = *allocations[i];
+            const auto& meta = requests[i].meta;
+            allocation.written = meta.size;
+            impl_->written_bytes.fetch_add(meta.size, std::memory_order_relaxed);
             impl_->record_writes.fetch_add(1, std::memory_order_relaxed);
             if (impl_->verification == SSDVerification::READ_BACK) {
                 IOTimer verifying{impl_->publish_ns};
-                impl_->checked_read(a, r.meta);
+                impl_->checked_read(allocation, meta);
             }
-            a.meta = r.meta;
-            a.sealed = true;
+            allocation.meta = meta;
+            allocation.sealed = true;
         }
     };
     if (impl_->device) {
-        shard(0, requests.size(), nullptr, 0);
-    } else if (requests.size() > 1) {
+        write_shard(0, requests.size(), nullptr, 0);
+        return;
+    }
+    if (requests.size() > 1) {
         impl_->prepare_parallel(true);
         const auto chunk = (requests.size() + 3) / 4;
         impl_->parallel[true].batch->run([&](std::size_t lane) {
@@ -857,21 +789,27 @@ void SSDStorageBackend::write_published_many(const std::vector<StorageWrite>& re
                                                    : std::min(requests.size(), (lane + 1) * chunk);
             if (impl_->parallel_posix) {
                 FileIO direct;
-                shard(first, end, &direct, lane);
-            } else {
-                shard(first, end, impl_->parallel[true].lanes[lane].get(), lane);
+                write_shard(first, end, &direct, lane);
+                return;
             }
+            write_shard(first, end, impl_->parallel[true].lanes[lane].get(), lane);
         });
-    } else if (impl_->parallel_posix) {
-        FileIO direct;
-        shard(0, requests.size(), &direct, allocations[0]->slot % impl_->file_count);
-    } else if(requests[0].meta.size>=1024*1024) {
-        impl_->prepare_parallel(true);
-        const auto lane=request_lane(true);
-        shard(0,requests.size(),impl_->parallel[true].lanes[lane].get(),allocations[0]->slot%impl_->file_count);
-    } else {
-        shard(0, requests.size(), impl_->io.get(), allocations[0]->slot % impl_->file_count);
+        return;
     }
+
+    const auto file_shard = allocations.front()->slot % impl_->file_count;
+    if (impl_->parallel_posix) {
+        FileIO direct;
+        write_shard(0, 1, &direct, file_shard);
+        return;
+    }
+    if (requests.front().meta.size >= 1024 * 1024) {
+        impl_->prepare_parallel(true);
+        const auto lane = request_lane(true);
+        write_shard(0, 1, impl_->parallel[true].lanes[lane].get(), file_shard);
+        return;
+    }
+    write_shard(0, 1, impl_->io.get(), file_shard);
 }
 void SSDStorageBackend::validate(StorageHandle handle, const BlockMeta& meta) const {
     // 全局锁仅查表；记录锁保护这一槽的生命周期和完整 I/O，其他槽可并行。
@@ -911,7 +849,7 @@ void SSDStorageBackend::read_validated_many(const std::vector<StorageRead>& requ
     IOTimer timer{impl_->read_ns};
     std::vector<std::shared_ptr<Impl::Allocation>> allocations(requests.size());
     std::vector<std::unique_lock<std::mutex>> locks;
-    std::vector<Header> headers(requests.size());
+    std::vector<SSDRecordHeader> headers(requests.size());
     std::vector<FileIORequest> ranges(2 * requests.size());
     auto order = impl_->lock_batch(requests, allocations, locks);
     for (auto i : order) {

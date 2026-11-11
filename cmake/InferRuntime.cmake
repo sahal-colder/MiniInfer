@@ -69,8 +69,11 @@ function(infer_add_runtime root)
         ${INFER_RUNTIME_ROOT}/src/storage/cpu_storage.cpp
         ${INFER_RUNTIME_ROOT}/src/storage/file_io.cpp
         ${INFER_RUNTIME_ROOT}/src/storage/kv_offload_cache.cpp
+        ${INFER_RUNTIME_ROOT}/src/storage/kv_offload_io.cpp
+        ${INFER_RUNTIME_ROOT}/src/storage/kv_offload_prefetch.cpp
         ${INFER_RUNTIME_ROOT}/src/storage/migration_executor.cpp
         ${INFER_RUNTIME_ROOT}/src/storage/spdk_device.cpp
+        ${INFER_RUNTIME_ROOT}/src/storage/ssd_record.cpp
         ${INFER_RUNTIME_ROOT}/src/storage/ssd_storage.cpp
         ${INFER_RUNTIME_ROOT}/src/storage/storage_block.cpp
         ${INFER_RUNTIME_ROOT}/src/storage/tiered_storage.cpp
